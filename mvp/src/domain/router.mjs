@@ -21,7 +21,7 @@ const RULES = [
   {
     taskType: 'design-change',
     id: 'rule-design-change',
-    keywords: ['变更', '改版', '替换', '改板', 'ecn', '原理图', 'pcb', 'bom', '降额', '选型'],
+    keywords: ['变更', '改版', '替换', '改板', 'ecn', '原理图', 'pcb', 'bom', '降额', '选型', '增加', '新增', '添加'],
     reason: '命中设计变更关键词 → 走 ECN，并做影响分析',
   },
   {

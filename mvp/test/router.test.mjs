@@ -8,6 +8,8 @@ const cases = [
   ['客户反馈 T23 串口升级到 32KB 时必失败，boot 回 CAN CAN', 'quality-8d', 'S5'],
   ['现场返修发现模块不工作，需 8D', 'quality-8d', 'S5'],
   ['把 BOM 里的 MOS 管从 A 换成 B', 'design-change', 'S2'],
+  // 功能新增（未出现"变更/改版"字样）也应识别为设计变更，而不是 clarify
+  ['T23项目增加按键双击进入BLE的配对功能', 'design-change', 'S2'],
   ['产线贴片工艺参数调整，需要更新控制计划', 'process-change', 'S3'],
   ['启动 PCU30 新项目立项，客户已定点', 'project-init', 'S1'],
   ['跑一轮温循试验并出报告', 'test', 'S4'],

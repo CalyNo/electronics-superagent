@@ -95,10 +95,23 @@ export function createPanelServer({ runtime, host = '127.0.0.1', port = 8787 }) 
     try {
       // 飞书事件回调
       if (req.method === 'POST' && path === '/feishu/event') {
-        if (!runtime.source || runtime.sourceKind !== 'feishu') return send(res, 404, { error: '飞书来源未启用' });
+        const remote = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+        if (!runtime.source || runtime.sourceKind !== 'feishu') {
+          console.log(`[feishu] inbound from ${remote} rejected: source not feishu`);
+          return send(res, 404, { error: '飞书来源未启用' });
+        }
         const body = await readBody(req);
-        const out = await runtime.source.handleEvent(body);
-        return send(res, 200, out);
+        const kind = body?.type || body?.header?.event_type || 'unknown';
+        // 入站日志：用于区分"飞书没发"与"发了被拒"，排障时最有用
+        console.log(`[feishu] inbound from ${remote} kind=${kind}`);
+        try {
+          const out = await runtime.source.handleEvent(body);
+          console.log(`[feishu] handled kind=${kind} -> ${JSON.stringify(out)}`);
+          return send(res, 200, out);
+        } catch (err) {
+          console.log(`[feishu] REJECTED kind=${kind} status=${err.status ?? 500} msg=${err.message}`);
+          return send(res, err.status ?? 500, { error: err.message });
+        }
       }
 
       if (req.method === 'GET' && (path === '/' || path === '/index.html')) {

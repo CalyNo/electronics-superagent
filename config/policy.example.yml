@@ -33,7 +33,7 @@ rules:
       交付物：ECN 变更通知（模板 16）+ 受影响文档更新。
       重大变更（涉及安全/法规/客户特殊特性）必须走变更委员会。
     match:
-      keywords: [变更, 改版, 替换, 优化设计, ECN, 改板]
+      keywords: [变更, 改版, 替换, 优化设计, ECN, 改板, 增加, 新增, 添加]
       taskType: design-change
     defaultSeverity: medium
 
