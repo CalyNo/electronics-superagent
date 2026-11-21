@@ -454,10 +454,29 @@ export class Engine {
       this.policy.describe(actorId).name, at, note, at, gateId
     );
     this.audit(actorId, 'gate.released', gateId, note);
+    // 门禁放行 = 阶段完成：关闭所有指向该门且待评审的工单（docs/02 §4 状态对应表）
+    const signer = this.policy.describe(actorId).name;
+    const tickets = this.db.all(
+      "SELECT id, thread_id FROM ticket WHERE gate_target = ? AND status = 'review'", gateId
+    );
+    const closedIds = [];
+    for (const t of tickets) {
+      try {
+        this.transitionTicket(t.id, 'closed', {
+          actor: actorId,
+          note: `门禁 ${gateId} 已由 ${signer} 签署放行${note ? '：' + note : ''}`,
+        });
+        closedIds.push(t.id);
+      } catch (err) {
+        // 无有效产物的工单不能关闭，保留在 review 并在审计里留痕，避免静默跳过
+        this.audit(actorId, 'ticket.close-skipped', t.id, `${gateId} 放行但无法关闭：${err.message}`);
+      }
+    }
     this.enqueueOutbox({
       kind: 'reply',
       dedupeKey: `gate:${gateId}:${at}`,
-      payload: { threadId: null, text: `门禁 ${gateId}（${g.name}）已由 ${this.policy.describe(actorId).name} 签署放行。` },
+      payload: { threadId: null, text: `门禁 ${gateId}（${g.name}）已由 ${signer} 签署放行。`
+        + (closedIds.length ? `\n阶段完成，工单 ${closedIds.join('、')} 已关闭，可进入下一阶段。` : '') },
     });
     return this.getGate(gateId);
   }
@@ -468,6 +487,13 @@ export class Engine {
     if (g.status !== 'pending') throw new UserError('gate/not-pending', `门禁 ${gateId} 当前是 ${g.status}`);
     this.db.run("UPDATE gate SET status = 'returned', note = ?, updated_at = ? WHERE id = ?", reason, this.now(), gateId);
     this.audit(actorId, 'gate.returned', gateId, reason);
+    // 门禁退回 = 阶段未通过：对应工单回到阻塞态，等待按原因修订后重交
+    const tickets = this.db.all(
+      "SELECT id FROM ticket WHERE gate_target = ? AND status IN ('review','working')", gateId
+    );
+    for (const t of tickets) {
+      this.transitionTicket(t.id, 'blocked', { actor: actorId, note: `门禁 ${gateId} 退回：${reason}` });
+    }
     return this.getGate(gateId);
   }
 

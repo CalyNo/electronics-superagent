@@ -148,6 +148,40 @@ test('门禁：非 pending 状态不能签署', async () => {
   assert.throws(() => engine.signGate('G1', { actorId: 'u_pm' }), /只有待签署状态才能签署/);
 });
 
+test('门禁放行关闭对应工单，退回则阻塞', async () => {
+  const mkTicket = async (engine, externalId, threadKey) => {
+    engine.receive(evt({ externalId, threadKey }));
+    const threadId = engine.pendingThreads().find((t) => t.threadId.includes(threadKey))?.threadId
+      ?? engine.pendingThreads()[0].threadId;
+    const ev = engine.evaluate(threadId);
+    const { ticketId } = engine.accept(ev.id);
+    engine.transitionTicket(ticketId, 'working');
+    engine.transitionTicket(ticketId, 'review');
+    engine.registerAsset({ ticketId, kind: 'document', docType: 'CHTR', stage: 'S1', path: `docs/${ticketId}.md`, status: 'valid' });
+    return ticketId;
+  };
+
+  // 放行：所有指向 G1 且待评审的工单都关闭
+  const { engine: e1 } = await newEngine();
+  const t1 = await mkTicket(e1, 'm1', 't1');
+  const t2 = await mkTicket(e1, 'm2', 't2');
+  assert.equal(e1.getTicket(t1).gate_target, 'G1');
+  assert.equal(e1.getTicket(t2).gate_target, 'G1');
+  e1.ensureGate('G1', { name: '立项批准', stage: 'S1' });
+  e1.refreshGate('G1', { status: 'pending', checks: [] });
+  e1.signGate('G1', { actorId: 'u_pm', note: '同意' });
+  assert.equal(e1.getTicket(t1).status, 'closed');
+  assert.equal(e1.getTicket(t2).status, 'closed');
+
+  // 退回：对应工单回到 blocked
+  const { engine: e2 } = await newEngine();
+  const t3 = await mkTicket(e2, 'm3', 't3');
+  e2.ensureGate('G1', { name: '立项批准', stage: 'S1' });
+  e2.refreshGate('G1', { status: 'pending', checks: [] });
+  e2.returnGate('G1', { actorId: 'u_pm', reason: '补材料' });
+  assert.equal(e2.getTicket(t3).status, 'blocked');
+});
+
 test('人可撤回，执行器不可自我停止', async () => {
   const { engine } = await newEngine();
   engine.receive(evt());
