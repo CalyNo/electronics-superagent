@@ -1,0 +1,20 @@
+{
+  "name": "@local/electronics-superagent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "电子超体 superagent 的 DSH/Cordis bundle：宿主插件 + software-engineer 固件岗位 preset",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml",
+    "skills/**/*"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

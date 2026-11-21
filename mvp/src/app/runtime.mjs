@@ -220,6 +220,7 @@ export class Runtime {
           pool: this.pool,
           budget: this.modelInfo?.budget,
           aiFill: this.options.aiFill !== false,
+          codeModifier: this.options.codeModifier ?? null,
         },
       });
 

@@ -49,7 +49,10 @@ export async function runAssignment({
   }
   for (const target of codeTargets) {
     try {
-      const res = await modifySourceFile({
+      // 代码修改后端可注入：默认走内置 codegen（自建模型网关）；
+      // DSH 插件运行时注入 agentCodeModifier，由 software-engineer preset 在 DSH 会话内改固件。
+      // 两种后端都返回 { changed, sha256, backupPath?, model?, keyId?, tokens? }。
+      const req = {
         projectRoot: project.root,
         relPath: target.relPath,
         requirement: target.requirement ?? ticket.title,
@@ -57,7 +60,10 @@ export async function runAssignment({
         pool: options.pool,
         budget: options.budget ?? {},
         engine, ticketId: ticket.id, positionCode: 'SW',
-      });
+      };
+      const res = typeof options.codeModifier === 'function'
+        ? await options.codeModifier(req)
+        : await modifySourceFile(req);
       const id = 'CODE-' + sha256Text(target.relPath + ticket.id).slice(0, 8).toUpperCase();
       assets.push({
         kind: 'code', id, docType: 'CODE', stage: plan.stage ?? 'S2',
