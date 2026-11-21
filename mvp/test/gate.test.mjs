@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { runGateChecks, extractOps, extractSpecialCharacteristics } from '../src/domain/gate.mjs';
 import { stringifyYaml } from '../src/domain/templates.mjs';
+import { GATES, TASK_PLANS } from '../src/domain/stages.mjs';
 
 const project = (root) => ({
   root,
@@ -50,6 +51,11 @@ test('特殊特性提取：CC/SC 及带前缀形式', () => {
   const set = extractSpecialCharacteristics('PCU24-CC-03 与 SC-12');
   assert.ok(set.has('CC-03'));
   assert.ok(set.has('SC-12'));
+});
+
+test('特殊特性提取：忽略文档编号与生成页脚里的 SC-xxx', () => {
+  const set = extractSpecialCharacteristics('由 electronics-superagent 生成 DOC-S2-SC-001\n真实特性 CC-07');
+  assert.deepEqual([...set], ['CC-07']);
 });
 
 test('G3 通过：流程图与 PFMEA 工序一一对应', async () => {
@@ -106,4 +112,13 @@ test('G1 失败：交付物不全时给出缺哪些', async () => {
   assert.equal(present.ok, false);
   assert.match(present.detail, /SRS/);
   assert.equal(res.status, 'preparing');
+});
+
+test('任务计划必须产出其目标门禁要求的全部交付物', () => {
+  for (const [taskType, plan] of Object.entries(TASK_PLANS)) {
+    if (!plan.gateTarget) continue;
+    const required = GATES[plan.gateTarget]?.deliverables ?? [];
+    const missing = required.filter((t) => !plan.docTypes.includes(t));
+    assert.deepEqual(missing, [], `${taskType} → ${plan.gateTarget} 缺交付物：${missing.join(',')}`);
+  }
 });

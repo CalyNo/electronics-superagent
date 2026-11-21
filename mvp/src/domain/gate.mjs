@@ -16,7 +16,10 @@ export function extractOps(text) {
 
 export function extractSpecialCharacteristics(text) {
   const set = new Set();
-  for (const m of String(text).matchAll(/\b(?:[A-Z]{2,6}-)?(CC|SC)-(\d{1,3})\b/g)) {
+  const s = String(text);
+  for (const m of s.matchAll(/\b(?:[A-Z]{2,6}-)?(CC|SC)-(\d{1,3})\b/g)) {
+    // 文档编号（DOC-S2-SC-001、生成页脚等）不是申报的特殊特性，不能计入覆盖性检查
+    if (/DOC-[A-Z0-9-]*$/.test(s.slice(Math.max(0, m.index - 24), m.index))) continue;
     set.add(`${m[1]}-${String(m[2]).padStart(2, '0')}`);
   }
   return set;

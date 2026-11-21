@@ -73,11 +73,13 @@ export const TASK_PLANS = {
     branchPrefix: 'agent/', commitPrefix: 'feat', defaultSeverity: 'medium',
   },
   'design-change': {
-    stage: 'S2', gateTarget: 'G2', docTypes: ['ECN', 'DFMEA', 'DVP'],
+    // G2 齐套要求 DFMEA/DVP/SC；SC 必须随设计变更产出，否则门禁永远停在 preparing
+    stage: 'S2', gateTarget: 'G2', docTypes: ['ECN', 'DFMEA', 'DVP', 'SC'],
     branchPrefix: 'change/', commitPrefix: 'change', defaultSeverity: 'medium',
   },
   'process-change': {
-    stage: 'S3', gateTarget: 'G3', docTypes: ['ECN', 'PFMEA', 'CP'],
+    // G3 齐套要求 PFC/PFMEA/CP；同理 PFC 不可缺
+    stage: 'S3', gateTarget: 'G3', docTypes: ['ECN', 'PFMEA', 'CP', 'PFC'],
     branchPrefix: 'change/', commitPrefix: 'change', defaultSeverity: 'medium',
   },
   'quality-8d': {

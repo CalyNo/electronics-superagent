@@ -208,14 +208,19 @@ function renderWork() {
 
   const gs = d.gates.map(g => {
     const gaps = (g.checks || []).filter(c => !c.ok && !c.skipped);
+    const actions = g.status === 'pending'
+      ? '<button class="primary" data-gate="' + esc(g.id) + '" data-act="sign">签署放行</button> '
+        + '<button class="danger" data-gate="' + esc(g.id) + '" data-act="return">退回</button>'
+      : '<span class="muted">' + (g.status === 'released' ? '已放行' : '需先补齐缺口') + '</span>';
     return '<tr><td><code>' + esc(g.id) + '</code></td><td>' + esc(g.name) + '</td>'
       + '<td><span class="tag ' + stCls(g.status) + '">' + esc(g.status) + '</span></td>'
       + '<td class="muted">' + (gaps.length ? esc(gaps.map(c => c.detail).join('；')).slice(0, 120) : '无缺口') + '</td>'
-      + '<td class="muted">' + esc(g.signed_by || '-') + '</td></tr>';
+      + '<td class="muted">' + esc(g.signed_by || '-') + '</td>'
+      + '<td>' + actions + '</td></tr>';
   }).join('');
   document.getElementById('gates').innerHTML = gs
-    ? '<table><thead><tr><th>门</th><th>名称</th><th>状态</th><th>缺口</th><th>签署人</th></tr></thead><tbody>' + gs + '</tbody></table>'
-      + '<div class="notice" style="margin-top:8px">门禁只能由人签署，机器最多推进到「待签署」。到 <a class="nav" href="/">运行面板</a> 完成签署。</div>'
+    ? '<table><thead><tr><th>门</th><th>名称</th><th>状态</th><th>缺口</th><th>签署人</th><th>操作</th></tr></thead><tbody>' + gs + '</tbody></table>'
+      + '<div class="notice" style="margin-top:8px">门禁只能由人签署：机器最多推进到「待签署」，出现缺口时先补齐交付物。首次签署会要求输入签署人的飞书 open_id（仅存本机浏览器）。</div>'
     : '<div class="empty">尚未生成门禁。</div>';
 }
 
@@ -304,6 +309,29 @@ document.addEventListener('click', async (ev) => {
         tokensPerDay: Number(document.getElementById('budgetDay').value),
       }) });
       await Promise.all([loadKeys(), loadWork()]); toast('预算已保存', 'ok');
+    } catch (e) { toast(e.message, 'bad'); }
+    return;
+  }
+
+  // 阶段门：签署 / 退回（只有 pending 才渲染按钮，服务端仍会二次校验权限）
+  if (btn.dataset.gate) {
+    const gate = btn.dataset.gate;
+    const gateAct = btn.dataset.act;
+    let openId = localStorage.getItem('sa_openId');
+    if (!openId) {
+      openId = prompt('请输入签署人的飞书 open_id（例如 ou_xxx）：');
+      if (!openId) return;
+      localStorage.setItem('sa_openId', openId.trim());
+    }
+    const note = prompt(gateAct === 'sign' ? '签署意见（可留空）：' : '退回原因：', '');
+    // 契约：sign 接口读 note，return 接口读 reason —— 字段不能混用
+    const body = gateAct === 'sign'
+      ? { openId: openId.trim(), note: note || null }
+      : { openId: openId.trim(), reason: note || '退回' };
+    try {
+      await api('/api/gates/' + gate + '/' + gateAct, { method: 'POST', body: JSON.stringify(body) });
+      toast(gate + (gateAct === 'sign' ? ' 已签署放行' : ' 已退回'), 'ok');
+      await loadWork();
     } catch (e) { toast(e.message, 'bad'); }
     return;
   }
