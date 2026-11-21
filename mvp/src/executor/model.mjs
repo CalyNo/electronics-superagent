@@ -100,12 +100,13 @@ export async function resolveModelConfig({ env = process.env, file = null, overr
       tokensPerDay: Number(fromFile.budget?.tokensPerDay) || 2000000,
     },
     timeoutMs: Number(fromFile.timeoutMs) || 60000,
-    maxTokens: Number(fromFile.maxTokens) || 1200,
+    // 默认 4096：文档填充要求一次返回多节 JSON（每节可达 600 字），1200 必然截断
+    maxTokens: Number(fromFile.maxTokens) || 4096,
     warnings,
   };
 }
 
-export function createHttpGateway({ baseUrl, apiKey, model, timeoutMs = 60000, maxTokens = 1200 }) {
+export function createHttpGateway({ baseUrl, apiKey, model, timeoutMs = 60000, maxTokens = 4096 }) {
   if (!baseUrl || !apiKey) return nullGateway;
   return {
     name: `http:${model || 'default'}`,
@@ -147,10 +148,16 @@ export function createHttpGateway({ baseUrl, apiKey, model, timeoutMs = 60000, m
                 : '服务端错误';
           throw new Error(`模型网关返回 ${res.status}（${hint}）：${detail}`);
         }
+        const finishReason = data.choices?.[0]?.finish_reason ?? null;
         return {
           text: data.choices?.[0]?.message?.content ?? null,
           object: null,
           usage: { tokens: data.usage?.total_tokens ?? 0 },
+          finishReason,
+          // 'length' 表示输出被 max_tokens 截断。调用方必须据此判为"不完整"，
+          // 否则会被下游当成"模型返回了非法 JSON"，把配置问题误报成模型问题。
+          truncated: finishReason === 'length',
+          model: data.model ?? model ?? null,
         };
       } finally {
         clearTimeout(timer);

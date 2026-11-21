@@ -144,6 +144,16 @@ export async function fillDocument({
   }
   if (!res?.text) return { skipped: true, reason: res?.reason ?? '模型未返回内容' };
 
+  // 输出被 max_tokens 截断时 JSON 必然不完整。必须给出可操作的诊断，
+  // 不能让运维去猜"为什么模型返回非法 JSON"。
+  if (res.truncated) {
+    return {
+      skipped: true,
+      reason: '模型输出被 max_tokens 截断，JSON 不完整已丢弃；请在 ~/.superagent/model.yml 提高 maxTokens（建议 ≥4096）或减少章节',
+      model: res.model, keyId: res.keyId, tokens: res.usage?.tokens ?? 0,
+    };
+  }
+
   const data = extractJson(res.text);
   if (!data || !Array.isArray(data.sections)) {
     return { skipped: true, reason: '模型返回的不是约定 JSON，已丢弃', model: res.model, keyId: res.keyId, tokens: res.usage?.tokens ?? 0 };

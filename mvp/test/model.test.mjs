@@ -4,7 +4,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  resolveModelConfig, gatewayFromConfig, maskKey, nullGateway, DEFAULT_MODEL_FILE,
+  resolveModelConfig, gatewayFromConfig, maskKey, nullGateway, DEFAULT_MODEL_FILE, createHttpGateway,
 } from '../src/executor/model.mjs';
 
 const KEY = 'sk-1234567890abcdefghijklmnop';
@@ -81,6 +81,27 @@ test('完全没配置：退化为 nullGateway，不抛错', async () => {
   const out = await nullGateway.generate({ prompt: 'x' });
   assert.equal(out.text, null);
   assert.match(out.reason, /未配置/);
+});
+
+test('网关识别 max_tokens 截断（finish_reason=length），不把它误报成非法 JSON', async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  const body = (finish, content) => ({
+    ok: true,
+    text: async () => JSON.stringify({ model: 'deepseek-chat', choices: [{ message: { content }, finish_reason: finish }], usage: { total_tokens: 10 } }),
+    json: async () => ({ model: 'deepseek-chat', choices: [{ message: { content }, finish_reason: finish }], usage: { total_tokens: 10 } }),
+  });
+  globalThis.fetch = async () => body('length', '{"sections":[{"heading":"x","content":"未闭合');
+
+  const gw = createHttpGateway({ baseUrl: 'https://api.example.com/v1', apiKey: KEY, model: 'deepseek-chat' });
+  const out = await gw.generate({ prompt: 'x' });
+  assert.equal(out.truncated, true);
+  assert.equal(out.finishReason, 'length');
+  assert.equal(out.model, 'deepseek-chat');
+
+  globalThis.fetch = async () => body('stop', '{"sections":[]}');
+  const ok = await gw.generate({ prompt: 'x' });
+  assert.equal(ok.truncated, false);
 });
 
 test('密钥掩码只露首尾，不足以复用', () => {

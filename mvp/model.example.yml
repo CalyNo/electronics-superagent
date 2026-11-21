@@ -52,4 +52,5 @@ budget:
 
 # 可选：超时与单次输出上限
 timeoutMs: 60000
-maxTokens: 1200
+# 文档填充一次返回多节 JSON，太小会截断（finish_reason=length），建议 ≥4096
+maxTokens: 4096
