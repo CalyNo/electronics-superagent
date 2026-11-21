@@ -13,7 +13,7 @@ export const STAGE_ORDER = ['S1', 'S2', 'S3', 'S4', 'S5'];
 
 export const DOC_TYPES = {
   CHTR:  { name: '项目章程',      stage: 'S1', template: '01-项目章程.md',   owner: '项目负责人' },
-  SRS:   { name: '需求规格书',    stage: 'S1', template: '02-需求规格书.md', owner: '系统工程师' },
+  SRS:   { name: '需求规格书',    stage: 'S1', template: '02-需求规格书.md', owner: '软件工程师' },
   APQP:  { name: 'APQP 项目计划', stage: 'S1', template: '03-APQP项目计划.md', owner: '项目负责人' },
   FEAS:  { name: '可行性分析',    stage: 'S1', template: '04-可行性分析.md', owner: '跨职能小组' },
   DFMEA: { name: 'DFMEA',         stage: 'S2', template: '05-DFMEA.md',      owner: '设计工程师' },
@@ -29,6 +29,8 @@ export const DOC_TYPES = {
   TEST:  { name: '测试报告',      stage: 'S4', template: '17-测试报告.md',   owner: '测试工程师' },
   '8D':  { name: '8D 报告',       stage: 'S5', template: '15-8D报告.md',     owner: '质量工程师' },
   ECN:   { name: 'ECN 变更通知',  stage: 'S5', template: '16-ECN变更通知.md', owner: '变更委员会' },
+  // 固件代码变更：非文档交付物，无模板；由软件工程师(SW)岗位执行，路径受 firmware 白名单约束
+  CODE:  { name: '固件代码变更',  stage: 'S2', template: null, owner: '软件工程师', kind: 'code' },
 };
 
 export const DOC_TYPE_ORDER = Object.keys(DOC_TYPES);
@@ -81,6 +83,11 @@ export const TASK_PLANS = {
     // G3 齐套要求 PFC/PFMEA/CP；同理 PFC 不可缺
     stage: 'S3', gateTarget: 'G3', docTypes: ['ECN', 'PFMEA', 'CP', 'PFC'],
     branchPrefix: 'change/', commitPrefix: 'change', defaultSeverity: 'medium',
+  },
+  'code-change': {
+    // 固件代码修改：软件工程师(SW)执行，只改 firmware/ 应用代码，不套文档阶段门
+    stage: 'S2', gateTarget: null, docTypes: ['CODE'],
+    branchPrefix: 'change/', commitPrefix: 'fix', defaultSeverity: 'high',
   },
   'quality-8d': {
     stage: 'S5', gateTarget: null, docTypes: ['8D'],

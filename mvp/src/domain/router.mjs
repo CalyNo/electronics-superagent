@@ -7,6 +7,13 @@ import { DOC_TYPES, TASK_PLANS, planFor } from './stages.mjs';
 // 顺序敏感：越具体的规则越靠前，避免"产线参数变更"被判成设计变更
 const RULES = [
   {
+    // 固件代码改动优先于设计变更：否则"改固件实现双击配对"会先被 design-change 的"改/增加"命中
+    taskType: 'code-change',
+    id: 'rule-code-change',
+    keywords: ['改固件', '改代码', '写固件', '固件实现', '代码实现', 'firmware', '烧录代码', '固件代码'],
+    reason: '命中固件代码关键词 → 走 code-change，由软件工程师(SW)修改 firmware/ 应用代码',
+  },
+  {
     taskType: 'quality-8d',
     id: 'rule-quality-8d',
     keywords: ['投诉', '客诉', '反馈', '失效', '失败', '退货', '不良', '批量', '异常', '召回', '故障', '返修', '不工作'],

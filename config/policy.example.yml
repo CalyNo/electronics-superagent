@@ -95,8 +95,8 @@ sources:
         canSign: [G1, G2]
       - id: ou_xxx4
         name: 赵工
-        role: FW
-        canInitiate: [design-change, doc]
+        role: SW
+        canInitiate: [design-change, code-change, doc]
         canSign: []
       - id: ou_xxx5
         name: 陈工

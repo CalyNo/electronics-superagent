@@ -20,6 +20,7 @@ function gen(over = {}) {
 
 test('模板：DOC_TYPES 声明的每个模板文件都真实存在', () => {
   for (const [code, meta] of Object.entries(DOC_TYPES)) {
+    if (meta.kind === 'code') continue; // 代码类交付物无文档模板
     assert.ok(existsSync(path.join(ROOT, 'templates', meta.template)), `缺少模板 ${meta.template}（${code}）`);
   }
 });

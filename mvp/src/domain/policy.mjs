@@ -99,7 +99,12 @@ export function createPolicy({ policy, manifest }) {
 /** 授权范围：不可变，扩大范围必须新工单 */
 export function buildMandate({ ticket, assessment, manifest, policy, grantedBy }) {
   const stage = assessment.stage ?? ticket.stage;
-  const actionScope = [...new Set([...(assessment.docTypes ?? []), 'doc.write', 'repo.commit'])];
+  const docTypes = assessment.docTypes ?? [];
+  const actionScope = [...new Set([
+    ...docTypes, 'doc.write', 'repo.commit',
+    // 固件代码写权限只在 code-change 任务中授予，且不撤销既有范围
+    ...(docTypes.includes('CODE') ? ['code.write'] : []),
+  ])];
   return {
     id: `MND-${ticket.id.replace(/^TKT-/, '')}`,
     ticketId: ticket.id,

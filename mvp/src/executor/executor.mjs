@@ -11,6 +11,7 @@ import { runGateChecks } from '../domain/gate.mjs';
 import { validateDoc } from '../domain/templates.mjs';
 import { positionForDoc } from './positions.mjs';
 import { fillDocument, markAiAssisted } from './agent.mjs';
+import { modifySourceFile } from './codegen.mjs';
 import { ensureDir, todayISO, writeJson, sha256File, sha256Text, exists } from '../util/fsx.mjs';
 import { DOC_TYPES } from '../domain/stages.mjs';
 
@@ -36,8 +37,59 @@ export async function runAssignment({
     };
   }
 
+  // 固件代码变更（CODE）：无模板，按 plan.codeTargets 逐文件交给软件工程师(SW)岗位修改。
+  // codeTargets: [{ relPath, requirement?, notes? }]，需求缺省用工单标题。
+  const codeTargets = docTypes.includes('CODE') ? (plan.codeTargets ?? []) : [];
+  if (docTypes.includes('CODE') && !codeTargets.length) {
+    return {
+      status: 'blocked',
+      reason: 'code-change 任务缺少 plan.codeTargets（要改哪些固件文件），无法执行',
+      assets, notes,
+    };
+  }
+  for (const target of codeTargets) {
+    try {
+      const res = await modifySourceFile({
+        projectRoot: project.root,
+        relPath: target.relPath,
+        requirement: target.requirement ?? ticket.title,
+        notes: target.notes ?? '',
+        pool: options.pool,
+        budget: options.budget ?? {},
+        engine, ticketId: ticket.id, positionCode: 'SW',
+      });
+      const id = 'CODE-' + sha256Text(target.relPath + ticket.id).slice(0, 8).toUpperCase();
+      assets.push({
+        kind: 'code', id, docType: 'CODE', stage: plan.stage ?? 'S2',
+        title: `${ticket.title} · ${target.relPath}`,
+        relPath: target.relPath, absPath: path.resolve(project.root, target.relPath),
+        revision: 'wip', sha256: res.sha256,
+        validation: { ok: true, errors: [], warnings: res.changed ? [] : ['文件未发生变化'] },
+        position: 'SW', aiAssisted: true,
+        backupPath: res.backupPath,
+      });
+      engine.registerAsset({
+        ticketId: ticket.id, kind: 'code', docType: 'CODE', stage: plan.stage ?? 'S2',
+        path: target.relPath, revision: 'wip', sha256: res.sha256, status: 'valid',
+        title: `${ticket.title} · ${target.relPath}`, position: 'SW', aiAssisted: true,
+      });
+      notes.push(`固件代码修改：${target.relPath}${res.changed ? '' : '（无变化）'}`);
+      if (engine && res.tokens) engine.recordUsage({
+        ticketId: ticket.id, position: 'SW', pool: res.keyId ?? 'worker',
+        keyId: res.keyId ?? null, model: res.model ?? null, tokens: res.tokens,
+        purpose: `code:${target.relPath}`,
+      });
+    } catch (err) {
+      return {
+        status: 'blocked',
+        reason: `固件代码修改失败（${target.relPath}）：${err.message}`,
+        assets, notes,
+      };
+    }
+  }
+
   const generated = [];
-  for (const docType of docTypes) {
+  for (const docType of docTypes.filter((t) => t !== 'CODE')) {
     let doc = await generateDoc({
       project, docType, rules, fallbackTemplateDir,
       nextDocIndex: (stage, type) => engine.nextDocIndex(stage, type),

@@ -100,7 +100,7 @@ node src/cli.mjs gate  sign  G1 --dir ./pcu24 --as ou_xxx3 --note "立项评审�
         └→ Ticket + Mandate
              └→ 每份交付物按类型找岗位
                   PM 项目经理  ← CHTR / APQP / FEAS
-                  SE 系统工程师 ← SRS
+                  SW 软件工程师 ← SRS / 固件代码
                   HW 硬件工程师 ← DFMEA / SC / DVP
                   PE 工艺工程师 ← PFC / PFMEA / CP
                   QE 质量工程师 ← 8D / MSA / SPC / TR / PPAP / ECN
@@ -204,5 +204,5 @@ budget:
 - **`node:sqlite` 仍标记实验性**：升级 Node 大版本前请跑一遍测试。
 - **模型是直连，没有网关**：无票据、无按工单预算、无失败换 key。单人单实例够用；多人共用或需要 token 审计时必须换到 `docs/08` 描述的本地网关（迁移触发条件见 `docs/08` §8.3）。
 - **预算按 token 计，不按金额**：不同供应商单价差异大，代码里不硬编码价格；要按人民币熔断需在网关侧换算。
-- **岗位提示词是通用稿**：PM/SE/HW/PE/QE 五份提示词按行业通识写，落地时需按贵司术语与模板习惯调整（`src/executor/positions.mjs`）。
+- **岗位提示词是通用稿**：PM/SW/HW/PE/QE 五份提示词按行业通识写，落地时需按贵司术语与模板习惯调整（`src/executor/positions.mjs`）。
 - **AI 草稿必须人评审**：`aiAssisted: true` 的文档只是草稿；门禁的机械检查通过 ≠ 内容正确。

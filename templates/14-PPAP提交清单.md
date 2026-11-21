@@ -56,7 +56,7 @@ traceability:
 | --- | --- | --- | --- | --- | --- |
 | 1 | 设计记录 | 图纸、3D 模型、规范 | ☑ | `hardware/_released/hw1.2/` | HW |
 | 2 | 工程更改文件 | 所有已批准的 ECN | ☑ | `docs/S5-量产/ECN/` | PM |
-| 3 | 顾客工程批准 | 客户签署的设计批准 | ☐ | 待客户签署 | SE |
+| 3 | 顾客工程批准 | 客户签署的设计批准 | ☐ | 待客户签署 | SW |
 | 4 | 设计 FMEA | 最新版 DFMEA | ☑ | `DOC-S2-DFMEA-005` | HW |
 | 5 | 过程流程图 | 最新版 PFC | ☑ | `DOC-S3-PFC-008` | PE |
 | 6 | 过程 FMEA | 最新版 PFMEA | ☑ | `DOC-S3-PFMEA-009` | PE |
@@ -70,7 +70,7 @@ traceability:
 | 14 | 生产件样品 | 代表性样品 | ☑ | `evidence/samples/` | PE |
 | 15 | 标准样品 | 签样保存 | ☑ | `evidence/master-sample/` | QE |
 | 16 | 检具 | 检具清单与 MSA | ☑ | `evidence/gauges.pdf` | QE |
-| 17 | 顾客特殊要求 | CSR 符合性矩阵 | ☑ | `evidence/csr-matrix.pdf` | SE |
+| 17 | 顾客特殊要求 | CSR 符合性矩阵 | ☑ | `evidence/csr-matrix.pdf` | SW |
 | 18 | 零件提交保证书 | PSW 签署 | ☐ | 待签署 | QE |
 
 > 状态说明：☑ 完成　☐ 未完成　— 不适用（需备注理由）

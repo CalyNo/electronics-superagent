@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { assess, clarifyQuestion } from '../src/domain/router.mjs';
+import { POSITIONS, positionForDoc } from '../src/executor/positions.mjs';
 
 const cases = [
   ['客户投诉 PCU24 低温启动偶发失效，已退货 3 台', 'quality-8d', 'S5'],
@@ -50,4 +51,18 @@ test('路由：仅提到文档类型也能落成补齐任务', () => {
   assert.equal(a.taskType, 'doc');
   assert.deepEqual(a.docTypes, ['CP']);
   assert.equal(a.stage, 'S3');
+});
+
+test('路由：固件代码修改 → code-change，由软件工程师执行', () => {
+  const a = assess({ text: '修改 T23 固件代码实现双击进入配对' });
+  assert.equal(a.taskType, 'code-change');
+  assert.deepEqual(a.docTypes, ['CODE']);
+  assert.equal(a.gateTarget, null);
+});
+
+test('路由：软件工程师代号为 SW', () => {
+  assert.equal(POSITIONS.SW.code, 'SW');
+  assert.equal(POSITIONS.SW.name, '软件工程师');
+  assert.equal(POSITIONS.SE, undefined);
+  assert.equal(positionForDoc('CODE').code, 'SW');
 });
