@@ -55,7 +55,7 @@ export const POSITIONS = {
     code: 'QE',
     name: '质量工程师',
     pool: 'doc',
-    docTypes: ['8D', 'MSA', 'SPC', 'TR', 'PPAP', 'ECN'],
+    docTypes: ['8D', 'MSA', 'SPC', 'TR', 'PPAP', 'ECN', 'TEST'],
     duty: '8D、MSA、过程能力、PPAP、变更管理',
     systemPrompt:
       '你是汽车电子质量工程师，熟悉 8D、MSA、SPC、PPAP 与 IATF 16949 记录要求。'

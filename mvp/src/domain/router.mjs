@@ -61,6 +61,7 @@ const DOC_HINTS = [
   { type: 'SRS', words: ['需求规格', '技术要求'] },
   { type: 'APQP', words: ['apqp'] },
   { type: 'FEAS', words: ['可行性'] },
+  { type: 'TEST', words: ['测试报告', '试验报告', '验证报告'] },
   { type: 'TR', words: ['试产'] },
 ];
 

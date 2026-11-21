@@ -559,7 +559,7 @@ do_apply() {
       S1) mkdirs="S1-策划/CHTR S1-策划/SRS S1-策划/APQP S1-策划/FEAS" ;;
       S2) mkdirs="S2-产品设计/DFMEA S2-产品设计/DVP S2-产品设计/SC" ;;
       S3) mkdirs="S3-过程设计/PFC S3-过程设计/PFMEA S3-过程设计/CP" ;;
-      S4) mkdirs="S4-验证/MSA S4-验证/SPC S4-验证/TR S4-验证/PPAP" ;;
+      S4) mkdirs="S4-验证/MSA S4-验证/SPC S4-验证/TR S4-验证/PPAP S4-验证/TEST" ;;
       S5) mkdirs="S5-量产/8D S5-量产/ECN" ;;
       *)  die "非法阶段：$s（可选 S1..S5）" ;;
     esac

@@ -26,6 +26,7 @@ export const DOC_TYPES = {
   SPC:   { name: '过程能力报告',  stage: 'S4', template: '12-过程能力报告.md', owner: '质量工程师' },
   TR:    { name: '试产报告',      stage: 'S4', template: '13-试产报告.md',   owner: '工艺质量' },
   PPAP:  { name: 'PPAP 提交清单', stage: 'S4', template: '14-PPAP提交清单.md', owner: '质量工程师' },
+  TEST:  { name: '测试报告',      stage: 'S4', template: '17-测试报告.md',   owner: '测试工程师' },
   '8D':  { name: '8D 报告',       stage: 'S5', template: '15-8D报告.md',     owner: '质量工程师' },
   ECN:   { name: 'ECN 变更通知',  stage: 'S5', template: '16-ECN变更通知.md', owner: '变更委员会' },
 };
@@ -84,7 +85,7 @@ export const TASK_PLANS = {
     branchPrefix: 'fix/', commitPrefix: 'fix', defaultSeverity: 'high',
   },
   test: {
-    stage: 'S4', gateTarget: null, docTypes: ['TR'],
+    stage: 'S4', gateTarget: null, docTypes: ['TEST'],
     branchPrefix: 'agent/', commitPrefix: 'test', defaultSeverity: 'medium',
   },
   doc: {

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
+import { DOC_TYPES } from '../src/domain/stages.mjs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDoc, validateDoc, parseFrontMatter, stringifyYaml, fillStats } from '../src/domain/templates.mjs';
@@ -16,6 +17,30 @@ function gen(over = {}) {
   };
   return buildDoc({ templateText: template8D, ctx });
 }
+
+test('模板：DOC_TYPES 声明的每个模板文件都真实存在', () => {
+  for (const [code, meta] of Object.entries(DOC_TYPES)) {
+    assert.ok(existsSync(path.join(ROOT, 'templates', meta.template)), `缺少模板 ${meta.template}（${code}）`);
+  }
+});
+
+test('模板：测试报告（TEST/S4）生成后结构校验通过（草稿）', () => {
+  const tpl = readFileSync(path.join(ROOT, 'templates/17-测试报告.md'), 'utf8');
+  const { text } = buildDoc({
+    templateText: tpl,
+    ctx: {
+      id: 'DOC-S4-TEST-001', title: '串口协议与功能测试', type: 'TEST', stage: 'S4',
+      project: 'T23', name: '蓝牙接收控制器', ticket: 'TKT-2026-0001', date: '2026-11-21',
+      classification: 'internal',
+    },
+  });
+  const res = validateDoc({
+    text, relPath: 'docs/S4-验证/TEST/DOC-S4-TEST-001-TEST.md',
+    rules: {}, expect: { stage: 'S4', type: 'TEST', project: 'T23' },
+  });
+  assert.equal(res.ok, true, res.errors.join('；'));
+  assert.ok(res.warnings.some((w) => w.includes('填充率')), '草稿应提示填充率');
+});
 
 test('模板：生成的文档 front-matter 必填键齐全', () => {
   const { text } = gen();

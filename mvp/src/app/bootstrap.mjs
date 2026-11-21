@@ -14,7 +14,7 @@ const STAGE_DIRS = {
   S1: ['docs/S1-策划/CHTR', 'docs/S1-策划/SRS', 'docs/S1-策划/APQP', 'docs/S1-策划/FEAS'],
   S2: ['docs/S2-产品设计/DFMEA', 'docs/S2-产品设计/DVP', 'docs/S2-产品设计/SC'],
   S3: ['docs/S3-过程设计/PFC', 'docs/S3-过程设计/PFMEA', 'docs/S3-过程设计/CP'],
-  S4: ['docs/S4-验证/MSA', 'docs/S4-验证/SPC', 'docs/S4-验证/TR', 'docs/S4-验证/PPAP'],
+  S4: ['docs/S4-验证/MSA', 'docs/S4-验证/SPC', 'docs/S4-验证/TR', 'docs/S4-验证/PPAP', 'docs/S4-验证/TEST'],
   S5: ['docs/S5-量产/8D', 'docs/S5-量产/ECN'],
 };
 
