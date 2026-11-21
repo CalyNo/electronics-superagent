@@ -1,0 +1,190 @@
+# ============================================================================
+# electronics-superagent 机器级配置（示意）
+# 放置位置：~/.dsh/profiles/electronics/cordis.patch.yml
+#
+# 说明：
+#   1. 本文件是"机器级"配置，只放进程启动必需项与机器限制。
+#   2. 业务配置（飞书来源、策略、执行器）通过管理 API 或面板设置，不在此处。
+#   3. 插件名与字段需按实际 bundle 调整；本示例用于说明结构。
+# ============================================================================
+
+- insert:
+    # ------------------------------------------------------------------
+    # 主插件：领域引擎、存储、执行器调度
+    # ------------------------------------------------------------------
+    - id: electronics-superagent
+      name: electronics-superagent
+      config:
+        # 必填：状态目录，存放数据库、锁、命令垫片、worker 凭证、工单目录
+        # 升级前必须备份此目录下的 orchestrator.sqlite
+        stateDir: /srv/superagent/state
+
+        # 可选：单次保存的提示词配置上限（字符）
+        promptMaxChars: 120000
+
+        # 可选：一次研判最多读取的线程页数与超时
+        admissionContextMaxPages: 5
+        admissionContextTimeoutMs: 30000
+
+        # 可选：机器限制
+        limits:
+          maxWorkers: 4           # 并发执行器上限
+          humanExtraSlot: 1       # 人工消息额外槽位
+          backgroundTimeoutMin: 30 # 单工单后台任务上限
+          ticketRetentionDays: 7   # 工单目录保留天数
+
+    # ------------------------------------------------------------------
+    # 飞书来源插件（单一信息源）
+    # ------------------------------------------------------------------
+    - id: electronics-superagent-feishu
+      name: electronics-superagent/feishu-watch
+      config:
+        # 应用凭据：仅引用环境变量，不写明文
+        appId: cli_xxxxxxxxxxxxxxxx
+        appSecretEnv: FEISHU_APP_SECRET
+
+        # 机器人专用 CLI（独立配置目录的包装脚本）
+        cli: /home/agent/.local/bin/lark-electronics
+
+        # 连接方式：长连接（推荐，免公网入口）或 webhook
+        mode: long-connection
+
+        # 事件去重窗口（秒）
+        dedupeWindowSeconds: 600
+
+        # 读取游标持久化位置（相对 stateDir）
+        cursorStore: feishu/cursor.json
+
+    # ------------------------------------------------------------------
+    # Web 面板
+    # ------------------------------------------------------------------
+    - id: electronics-superagent-panel
+      name: electronics-superagent/web-panel
+      config:
+        host: 127.0.0.1
+        port: 3082
+        # 仅本机可访问；如需远程访问请走 VPN 或反向代理 + 认证
+        allowedOrigins:
+          - http://127.0.0.1:3082
+          - http://localhost:3082
+
+    # ------------------------------------------------------------------
+    # 执行器预设：按 APQP 阶段裁剪工具集
+    # 每个预设的最小权限原则见 docs/05-仓库与执行器规范.md
+    # ------------------------------------------------------------------
+    - id: electronics-superagent-planner
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: electronics-planner
+        name: 电子超体·策划
+        description: S1 阶段专用，只写 docs/，不碰代码与硬件
+        order: 90
+        plugins:
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              # 仅允许写文档目录
+              writeRoots:
+                - docs/
+          - id: shell
+            name: cordis:group
+            group: true
+            config:
+              - id: bash-sandbox
+                name: '@deepseek-ai/dsh-bash-sandbox'
+                config:
+                  timeoutMs: 5000
+                  maxTimeoutMs: 5000
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+
+    - id: electronics-superagent-designer
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: electronics-designer
+        name: 电子超体·设计
+        description: S2 阶段专用，可写 docs/ 与 hardware/，不改固件
+        order: 91
+        plugins:
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              writeRoots:
+                - docs/
+                - hardware/
+          - id: shell
+            name: cordis:group
+            group: true
+            config:
+              - id: bash-sandbox
+                name: '@deepseek-ai/dsh-bash-sandbox'
+                config:
+                  timeoutMs: 5000
+                  maxTimeoutMs: 5000
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+
+    - id: electronics-superagent-verifier
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: electronics-verifier
+        name: 电子超体·验证
+        description: S4 阶段专用，可跑测试、写 evidence/，不改设计文档
+        order: 92
+        plugins:
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              writeRoots:
+                - evidence/
+                - docs/S4-验证/
+          - id: shell
+            name: cordis:group
+            group: true
+            config:
+              - id: bash-sandbox
+                name: '@deepseek-ai/dsh-bash-sandbox'
+                config:
+                  timeoutMs: 30000
+                  maxTimeoutMs: 300000
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+
+    # ------------------------------------------------------------------
+    # 主 Session 预设：只路由，不做技术决策
+    # ------------------------------------------------------------------
+    - id: electronics-superagent-router
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: electronics-router
+        name: 电子超体·路由
+        description: 主 Session 专用，只做准入研判与派工，不读写仓库
+        order: 99
+        plugins:
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              write: false
+              edit: false
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'

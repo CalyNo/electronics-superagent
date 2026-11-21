@@ -1,0 +1,12 @@
+# 硬件资料清单
+# 规则见 docs/03-资产分类规范.md §5.3：每次提交重算 sha256 并与本文件比对，
+# 不一致则拒绝提交。二进制文件必须有条目，没有条目的视为来源不明。
+version: hw-0.1
+released: null
+items: []
+#  items:
+#    - path: schematic/{{CODE}}-MainBoard-v0.1.SchDoc
+#      type: schematic
+#      revision: A
+#      owner: ""
+#      sha256: ""

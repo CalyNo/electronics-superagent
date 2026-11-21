@@ -1,0 +1,38 @@
+# ---- 编译产物与中间件 ----
+firmware/**/build/
+firmware/**/Debug/
+firmware/**/Release/
+software/**/dist/
+software/**/node_modules/
+software/**/__pycache__/
+*.o
+*.obj
+*.elf
+*.map
+*.lst
+*.d
+
+# ---- 工装与测试临时数据 ----
+test/hil/runs/
+test/hil/*.log
+test/unit/coverage/
+
+# ---- 密钥与本地配置（绝不可入库）----
+*.key
+*.pem
+.env
+.env.*
+local.yml
+*.secret
+
+# ---- superagent 运行时（状态库、工作目录、收发箱）----
+.state/
+.inbox/
+.outbox/
+
+# ---- 编辑器与系统 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

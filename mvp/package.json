@@ -1,0 +1,18 @@
+{
+  "name": "electronics-superagent-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "电子行业 superagent MVP：飞书单源接入、IATF 16949 阶段化执行、资产分类与仓库操作",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "bin": {
+    "superagent": "./src/cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "demo": "node src/cli.mjs demo",
+    "verify": "node src/cli.mjs verify --dir .demo/PCU24"
+  }
+}

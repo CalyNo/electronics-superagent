@@ -1,0 +1,215 @@
+# ============================================================================
+# 工程策略配置（版本化）
+# 写入方式：PUT /orchestrator/api/settings/policy
+# 每次修改生成新版本；受影响工单会收到变更通知，但不会被立即撤销授权
+# 建议：首次上线使用 acceptMode: observe，观察 2-4 周后再切 auto
+# ============================================================================
+
+version: pv-2026-11-21-a
+acceptMode: observe   # off | observe | auto
+
+# ----------------------------------------------------------------------------
+# 主动工作规则：研判器按规则判断"这条消息是否值得开工单"
+# 规则要短、可判定、可追溯；含糊的描述会让研判不稳定
+# ----------------------------------------------------------------------------
+rules:
+  - id: rule-quality-8d
+    name: 质量问题
+    instruction: |
+      当消息描述客户投诉、失效、退货、批量不良或产线异常时，按 8D 流程处理。
+      交付物：8D 报告，使用模板 15。
+      时限：D1 24h、D2 48h、D3 72h、D4 7d、D5 14d、D6 21d、D7 28d、D8 30d。
+      必须识别：问题现象、影响范围、是否涉及安全件。
+    match:
+      keywords: [投诉, 失效, 退货, 客诉, 不良, 批量, 异常]
+      taskType: quality-8d
+    defaultSeverity: high
+
+  - id: rule-design-change
+    name: 设计变更
+    instruction: |
+      当消息要求修改原理图、PCB、BOM、固件接口或性能指标时，按 ECN 流程处理。
+      必须先做影响分析：文档、代码、硬件、库存、客户。
+      交付物：ECN 变更通知（模板 16）+ 受影响文档更新。
+      重大变更（涉及安全/法规/客户特殊特性）必须走变更委员会。
+    match:
+      keywords: [变更, 改版, 替换, 优化设计, ECN, 改板]
+      taskType: design-change
+    defaultSeverity: medium
+
+  - id: rule-process-change
+    name: 过程变更
+    instruction: |
+      当消息涉及产线、工艺参数、工装、检具、测试方法的改变时，按过程变更流程处理。
+      必须更新：过程流程图、PFMEA、控制计划。
+      交付物：ECN + 三份过程文档更新。
+    match:
+      keywords: [产线, 工艺, 工装, 检具, 参数, 贴片, 焊接]
+      taskType: process-change
+    defaultSeverity: medium
+
+  - id: rule-doc-fill
+    name: 文档补齐
+    instruction: |
+      当消息要求补充或更新既有文档（DFMEA、PFMEA、控制计划、DVP 等）时，
+      定位对应模板，生成骨架，标注待补充项。
+      不得编造技术结论；不确定处必须标记为待人工确认。
+    match:
+      keywords: [补, 完善, 更新文档, 缺一份, 模板]
+      taskType: doc
+    defaultSeverity: low
+
+  - id: rule-test
+    name: 验证任务
+    instruction: |
+      当消息要求执行测试、试验或数据采集时，生成测试计划并执行。
+      交付物：测试报告 + 原始数据。
+      失败项必须关联 DFMEA 或 ECN。
+    match:
+      keywords: [测试, 试验, 验证, 温循, 振动, EMC, 老化]
+      taskType: test
+    defaultSeverity: medium
+
+# ----------------------------------------------------------------------------
+# 来源策略：人员白名单、机器人、准入表
+# ----------------------------------------------------------------------------
+sources:
+  feishu:
+    # 允许发起工作的人员（open_id）
+    # 列表为空时，任何请求都不会变成工单
+    allowed:
+      - id: ou_xxx1
+        name: 张工
+        role: HW
+        canInitiate: [design-change, doc, test]
+        canSign: [G2]
+      - id: ou_xxx2
+        name: 李工
+        role: QE
+        canInitiate: [quality-8d, process-change, doc]
+        canSign: [G3, G4]
+      - id: ou_xxx3
+        name: 王经理
+        role: PM
+        canInitiate: [project-init, design-change, process-change, quality-8d]
+        canSign: [G1, G2]
+      - id: ou_xxx4
+        name: 赵工
+        role: FW
+        canInitiate: [design-change, doc]
+        canSign: []
+      - id: ou_xxx5
+        name: 陈工
+        role: PE
+        canInitiate: [process-change, doc, test]
+        canSign: [G3]
+
+    # 允许产生"候选"的机器人（永远不会是明确请求）
+    bots:
+      - id: cli_bot_quality
+        name: 质量看板机器人
+      - id: cli_bot_ci
+        name: 构建通知机器人
+
+    # ------------------------------------------------------------------
+    # 准入表：按群配置三种情况的处理
+    #   listedUnaddressed   白名单成员、未 @
+    #   unlistedAddressed   非白名单、@ 了
+    #   unlistedUnaddressed 非白名单、未 @
+    # 取值：explicit | inferred | ignore
+    # ------------------------------------------------------------------
+    admission:
+      # 研发群：白名单未 @ 视为补充上下文；陌生人 @ 忽略
+      oc_aaa:
+        listedUnaddressed: inferred
+        unlistedAddressed: ignore
+        unlistedUnaddressed: ignore
+
+      # 质量问题群：陌生人 @ 也允许发起（客服/售后可直接报问题）
+      oc_bbb:
+        listedUnaddressed: inferred
+        unlistedAddressed: explicit
+        unlistedUnaddressed: ignore
+
+      # 供应商质量群：仅白名单可发起
+      oc_ccc:
+        listedUnaddressed: inferred
+        unlistedAddressed: ignore
+        unlistedUnaddressed: ignore
+
+      # 单聊
+      direct:
+        unlistedAddressed: ignore
+
+# ----------------------------------------------------------------------------
+# 阶段门：交付物清单与签署人
+# 系统只做完整性检查，签署必须由人完成
+# ----------------------------------------------------------------------------
+stageGates:
+  G1:
+    name: 立项批准
+    requiredDeliverables: [CHTR, SRS, APQP, FEAS]
+    automatableChecks:
+      - all_deliverables_present
+      - required_fields_filled
+      - risks_registered
+    signers: [ou_xxx3]
+  G2:
+    name: 设计冻结
+    requiredDeliverables: [DFMEA, DVP, SC]
+    automatableChecks:
+      - all_deliverables_present
+      - dfmea_high_ap_has_action
+      - dvp_covers_all_special_characteristics
+      - design_review_closed
+    signers: [ou_xxx1, ou_xxx3]
+  G3:
+    name: 过程就绪
+    requiredDeliverables: [PFC, PFMEA, CP]
+    automatableChecks:
+      - pfc_pfmea_step_match
+      - cp_covers_all_special_characteristics
+      - fixture_ready
+    signers: [ou_xxx5, ou_xxx2]
+  G4:
+    name: PPAP 批准
+    requiredDeliverables: [MSA, SPC, TR, PPAP]
+    automatableChecks:
+      - ppap_18_items_complete
+      - cpk_meets_requirement
+      - msa_grr_acceptable
+      - customer_approval_present
+    signers: [ou_xxx2]
+
+# ----------------------------------------------------------------------------
+# 执行约束
+# ----------------------------------------------------------------------------
+execution:
+  # 禁止执行器触碰的分支
+  protectedBranches: [main, develop, "release/*"]
+  # 执行器可推送的分支前缀
+  allowedBranchPrefixes: ["agent/", "feature/", "change/", "fix/"]
+  # 是否允许自动开 PR
+  autoOpenPr: true
+  # 是否允许自动合并（默认否，必须由人）
+  autoMerge: false
+  # 提交作者身份
+  commitAuthor:
+    name: electronics-superagent
+    email: agent@example.com
+  # 单工单最大改动行数（超过需人工确认）
+  maxDiffLines: 800
+  # 禁止执行的命令
+  blockedCommands:
+    - git push --force
+    - git reset --hard origin/main
+    - rm -rf /
+
+# ----------------------------------------------------------------------------
+# 记录与审计
+# ----------------------------------------------------------------------------
+audit:
+  retainYears: 15
+  immutable: true
+  hashChain: true
+  exportSchedule: monthly

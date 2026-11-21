@@ -1,0 +1,259 @@
+# ============================================================================
+# electronics-superagent 模型密钥池与预算配置（示意）
+# 读取者：本地模型网关（llm-gateway），不供执行器读取
+# 位置：/etc/electronics-superagent/ai-keys.yml（0600，属主 agent）
+#
+# 三条硬规则：
+#   1. 本文件只存环境变量名，绝不存密钥值（值来自 Vault / KMS / keys.d/）
+#   2. 本文件不得进入 Git、stateDir、工单目录、备份快照
+#   3. 修改后网关热加载，执行器无需重启
+# ============================================================================
+
+gateway:
+  host: 127.0.0.1
+  port: 8787
+  # 仅监听本地回环；执行器通过 127.0.0.1 访问，不暴露到网络
+  apiStyle: openai-compatible
+
+  # 票据机制：工单创建时签发，工单结束时吊销
+  ticket:
+    header: authorization
+    ttlMinutes: 720          # 覆盖最长工单（含后台任务 30 分钟 × 多轮重试）
+    bindToTicket: true       # 票据与 ticketId 绑定，换单即失效
+    revokeOn: ticketClosed
+
+  # 选 key 策略：最久未失败优先，避免重试打回同一把 key
+  selection: least-recently-failed
+  retry:
+    maxAttempts: 3
+    backoffMs: [1000, 2000, 4000]
+    jitter: true
+    # 仅在以下状态码时换 key 重试，其余直接上抛
+    retryOn: [429, 500, 502, 503, 504]
+
+# ----------------------------------------------------------------------------
+# 角色池：分配比例的依据见 docs/08-AI密钥与模型分配.md 第 2 节
+#   router ≈ 2% token / worker ≈ 85% / doc ≈ 5% / vision ≈ 8%
+# ----------------------------------------------------------------------------
+pools:
+
+  # ---- 研判：高频、短、延迟敏感，必须与长任务隔离 --------------------------
+  router:
+    purpose: 准入研判、任务分类、阶段判定
+    model: deepseek-chat
+    maxOutputTokens: 2048
+    temperature: 0.1
+    timeoutSeconds: 30
+    # 每把 key 的软并发上限（网关侧排队，不抛错）
+    concurrencyPerKey: 4
+    keys:
+      - id: ea-router-ds-01
+        env: EA_ROUTER_DS_01
+        provider: deepseek
+        region: cn
+        weight: 100
+      - id: ea-router-ds-02
+        env: EA_ROUTER_DS_02
+        provider: deepseek
+        region: cn
+        weight: 0             # 热备：仅在主 key 不可用时接管
+    # 研判失败不得阻塞接单：超时/不可用统一降级为 unavailable，下轮再试
+    onUnavailable: degrade-to-unavailable
+
+  # ---- 执行器：长上下文、多轮工具调用，占绝大多数配额 ----------------------
+  worker:
+    purpose: 五类阶段执行器（planner / designer / process / verifier / releaser）
+    model: deepseek-reasoner
+    maxOutputTokens: 8192
+    temperature: 0.2
+    timeoutSeconds: 300
+    concurrencyPerKey: 2      # 每 key 承载 2 个并发执行器较稳
+    keys:
+      - id: ea-worker-ds-01
+        env: EA_WORKER_DS_01
+        provider: deepseek
+        region: cn
+        weight: 50
+      - id: ea-worker-ds-02
+        env: EA_WORKER_DS_02
+        provider: deepseek
+        region: cn
+        weight: 50
+      - id: ea-worker-ds-03
+        env: EA_WORKER_DS_03
+        provider: deepseek
+        region: cn
+        weight: 0             # 热备，配额打满时启用
+      # 异构备厂商：解决厂商级故障，不是解决配额
+      - id: ea-worker-alt-01
+        env: EA_WORKER_ALT_01
+        provider: vendor-b
+        region: cn
+        weight: 0
+        model: vendor-b-pro
+        # 仅当主厂商整体不可用时启用
+        standbyOnly: true
+    # 关键：不允许为省钱降到弱档模型继续产出质量文档
+    onUnavailable: report-blocked
+    forbidSilentDowngrade: true
+
+  # ---- 长文档：可排队、可异步，用长上下文档位 ------------------------------
+  doc:
+    purpose: DFMEA、控制计划、PPAP 包、8D 报告的整篇生成
+    model: deepseek-chat
+    maxOutputTokens: 16384
+    temperature: 0.3
+    timeoutSeconds: 600
+    concurrencyPerKey: 2
+    # 排队而非抢占：不占用 worker 的并发槽位
+    queue:
+      maxWaitSeconds: 900
+    keys:
+      - id: ea-doc-ds-01
+        env: EA_DOC_DS_01
+        provider: deepseek
+        region: cn
+        weight: 100
+
+  # ---- 多模态：图纸、PCB 截图、客户扫描件 ----------------------------------
+  vision:
+    purpose: 原理图/PCB/扫描件识别与比对
+    model: vision-pro
+    maxOutputTokens: 4096
+    temperature: 0.0
+    timeoutSeconds: 120
+    concurrencyPerKey: 2
+    keys:
+      - id: ea-vision-ds-01
+        env: EA_VISION_DS_01
+        provider: deepseek
+        region: cn
+        weight: 100
+        # 合规：涉密图纸只允许走境内端点
+        allowedDataClass: [public, internal]
+      - id: ea-vision-private-01
+        env: EA_VISION_PRIVATE_01
+        provider: on-prem
+        region: intranet
+        weight: 0
+        # 客户受控资料（图纸、BOM、规格书）只能走私有化端点
+        allowedDataClass: [public, internal, restricted]
+        requiresDataClass: restricted
+    # 识别不可用时挂起工单，禁止让纯文本模型"猜"图纸内容
+    onUnavailable: report-blocked
+
+# ----------------------------------------------------------------------------
+# 路由规则：请求头 X-Role 决定池；阶段决定模型档位微调
+# ----------------------------------------------------------------------------
+routing:
+  defaultPool: worker
+  byRole:
+    router: router
+    worker: worker
+    doc: doc
+    vision: vision
+
+  # 阶段覆盖：能力匹配优先于省钱（见文档 3.1 节）
+  byStage:
+    S1: { pool: doc, model: deepseek-chat }
+    S2: { pool: worker, model: deepseek-reasoner }
+    S3: { pool: worker, model: deepseek-reasoner }
+    S4: { pool: doc, model: deepseek-chat }
+    S5: { pool: doc, model: deepseek-chat }
+
+  # 数据分级：restricted 强制走私有化端点，任何情况不得出境
+  byDataClass:
+    public: { allowProviders: [deepseek, vendor-b, on-prem] }
+    internal: { allowProviders: [deepseek, vendor-b, on-prem] }
+    restricted: { allowProviders: [on-prem], requireGatewayRegion: intranet }
+
+# ----------------------------------------------------------------------------
+# 预算：两层熔断，缺一层都不安全
+# ----------------------------------------------------------------------------
+budgets:
+  currency: CNY
+
+  # 第一层：日全局上限 —— 防系统性失控
+  daily:
+    limit: 300
+    warnAt: 0.8              # 达 80% 在面板告警
+    onExceed: switch-observe # 停止接新单，在跑工单允许收尾
+    resetAt: "00:00"
+
+  # 第二层：单工单上限 —— 防单张工单跑飞
+  perTicket:
+    limit: 30
+    warnAt: 0.8
+    onExceed: suspend-ticket # 挂起并保留现场，等人决定追加或拆单
+    # 按阶段差异化：S3/S4 天然更贵
+    byStage:
+      S1: 15
+      S2: 30
+      S3: 45
+      S4: 35
+      S5: 20
+
+  # 第三层（可选）：单池上限 —— 防某一角色独占预算
+  perPool:
+    vision: 50
+    doc: 60
+
+# ----------------------------------------------------------------------------
+# 缓存与成本优化
+# ----------------------------------------------------------------------------
+cache:
+  enabled: true
+  # 稳定前缀：模板、分类规范、策略段 —— 放在系统提示最前部以提高命中率
+  stablePrefixes:
+    - id: templates-catalog
+      source: docs/_templates/
+    - id: asset-taxonomy
+      source: docs/03-资产分类规范.md
+    - id: policy-block
+      source: policy:rendered
+  # 仅对输入 token 生效；输出不缓存
+  reportSavings: true
+
+# ----------------------------------------------------------------------------
+# 审计：只记元数据，不记 prompt 正文（受控资料不留存）
+# ----------------------------------------------------------------------------
+audit:
+  enabled: true
+  retentionDays: 180
+  fields:
+    - timestamp
+    - ticketId
+    - projectId
+    - stage
+    - role
+    - pool
+    - keyId
+    - model
+    - tokensIn
+    - tokensOut
+    - cachedTokensIn
+    - cost
+    - status
+    - latencyMs
+  # 明确排除：prompt、completion、附件内容
+  exclude: [prompt, completion, attachments]
+
+# ----------------------------------------------------------------------------
+# 告警阈值（面板与飞书运维群通知）
+# ----------------------------------------------------------------------------
+alerts:
+  - id: key-tpm-high
+    when: key.tpm.ratio > 0.7 for 15m
+    action: notify
+  - id: key-429
+    when: key.rate429 > 0.01 for 5m
+    action: notify-rotate
+  - id: pool-unavailable
+    when: pool.availableKeys == 0 for 2m
+    action: notify-and-block
+  - id: budget-warn
+    when: daily.spent.ratio > budgets.daily.warnAt
+    action: notify
+  - id: degraded-event
+    when: fallback.count > 0
+    action: notify-daily-digest

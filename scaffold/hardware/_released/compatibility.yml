@@ -1,0 +1,6 @@
+# 硬件-固件兼容矩阵
+# 规则见 docs/03-资产分类规范.md §4.5：发布包必须能在本表中找到对应组合。
+compatibility: []
+#  - hardware: hw-1.2
+#    firmware: [fw-1.3.0, fw-1.4.0]
+#    released: 2026-11-21

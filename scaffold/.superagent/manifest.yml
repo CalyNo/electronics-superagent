@@ -1,0 +1,76 @@
+# ============================================================================
+# 项目身份与能力开关
+# 读取者：electronics-superagent（启动与每次接单时）
+# 维护者：项目负责人
+#
+# 约束：
+#   1. code 一旦建立永不可改（它是资产 ID、分支名、目录名、审计键的共同前缀）
+#   2. 本文件任何改动都需要新工单，不允许执行器自行修改
+#   3. 字段缺失或非法会阻止实例启动
+# ============================================================================
+
+code: {{CODE}}                     # 2-8 位大写字母数字，终身不变
+name: {{NAME}}
+topology: A                        # A 独立仓库 | B 同仓命名空间 | C 多仓
+platform: {{PLATFORM}}             # 所属硬件/软件平台，如 PCU
+customer: {{CUSTOMER}}             # 主机厂或 Tier1 客户代号
+lifecycle: development             # development | production | eol
+baseline: baseline-v0.0.1          # 授权起点，工单 Mandate 记录此 tag
+
+# ---------------------------------------------------------------------------
+# 阶段与门禁：只建设已启用的阶段，避免空目录虚高齐套率
+# ---------------------------------------------------------------------------
+stages:
+  enabled: [S1]                    # 按 APQP 实际进度增加，如 [S1, S2]
+  gates:
+    G1:
+      name: 立项批准
+      requiredDeliverables: [CHTR, SRS, APQP, FEAS]
+      signedBy: []                 # 签署人飞书 open_id，必填后方可放行
+    # G2/G3/G4 在对应阶段启用时再补，不要提前占位
+
+# ---------------------------------------------------------------------------
+# 责任人：CODEOWNERS 与通知路由的依据
+# ---------------------------------------------------------------------------
+owners:
+  project:
+    name: {{OWNER_NAME}}
+    feishuOpenId: ""               # ou_xxx
+  quality:
+    name: ""
+    feishuOpenId: ""
+  platform:
+    name: ""
+    feishuOpenId: ""
+
+# ---------------------------------------------------------------------------
+# 系统绑定：与部署形态一一对应
+# ---------------------------------------------------------------------------
+system:
+  instance: {{codeLower}}          # 一个实例服务一个项目见 docs/09 §6
+  stateDir: /srv/superagent/state/{{codeLower}}
+  defaultClassification: internal  # public | internal | confidential | restricted
+  recordRetentionYears: 15         # 按客户与体系要求调整，不得低于 10
+
+# ---------------------------------------------------------------------------
+# 外部集成
+# ---------------------------------------------------------------------------
+integrations:
+  repo:
+    provider: github               # github | gitlab | gitee
+    url: ""                        # https://github.com/acme/{{codeLower}}.git
+    defaultBranch: develop
+    protectedBranches: [main, develop, "release/*"]
+    lfs: true
+  chat:
+    chatIds: []                    # 至少一个；与 policy 的 admission 表对应
+  docLibrary: null                 # 可选：飞书知识库或 PLM 空间 ID
+
+# ---------------------------------------------------------------------------
+# 数据分级：决定模型端点与导出权限（见 docs/08 §6）
+# ---------------------------------------------------------------------------
+dataClassification:
+  ceiling: confidential            # 本项目可能出现的最高密级
+  restrictedPaths:                 # 命中即禁止出境、禁止入模型上下文
+    - hardware/schematic/
+    - hardware/datasheet/

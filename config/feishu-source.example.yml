@@ -1,0 +1,105 @@
+# ============================================================================
+# 飞书来源配置（单一信息源）
+# 写入方式：PUT /orchestrator/api/settings/source:feishu
+# 所有 <...> 必须替换；密钥一律走环境变量，不写明文
+# ============================================================================
+
+enabled: true
+
+config:
+  # 自建应用凭据
+  appId: cli_xxxxxxxxxxxxxxxx
+  appSecretEnv: FEISHU_APP_SECRET
+
+  # 机器人专用 CLI（独立配置目录的包装脚本）
+  cli: /home/agent/.local/bin/lark-electronics
+
+  # 连接方式：long-connection（推荐）| webhook
+  mode: long-connection
+
+  # 本实例服务的产品线（一个实例一个项目）
+  project: PCU24
+
+  # ------------------------------------------------------------------
+  # 群配置：每个群绑定项目与允许的任务类型
+  # listen: mentions（仅 @）| all（全部消息，需应用有对应权限）
+  # ------------------------------------------------------------------
+  chats:
+    - chatId: oc_aaa
+      name: PCU24 研发群
+      listen: mentions
+      allowedTypes:
+        - design-change
+        - process-change
+        - doc
+        - test
+    - chatId: oc_bbb
+      name: 质量问题群
+      listen: mentions
+      allowedTypes:
+        - quality-8d
+    - chatId: oc_ccc
+      name: 供应商质量群
+      listen: mentions
+      allowedTypes:
+        - quality-8d
+
+  # 单聊：允许白名单成员私密发起
+  directMessages: true
+
+  # 未配置群的策略：mentions（仅 @ 时接收）| none（不接收）
+  otherChats: mentions
+
+  # ------------------------------------------------------------------
+  # 轮询与读取
+  # ------------------------------------------------------------------
+  polling:
+    intervalSeconds: 60
+    maxPagesPerPoll: 5
+    # 订阅线程在工单结束后继续轮询的时长（天）
+    subscribedRetentionDays: 14
+
+  # ------------------------------------------------------------------
+  # 附件处理
+  # ------------------------------------------------------------------
+  attachments:
+    maxSizeMB: 50
+    allowedTypes:
+      - image
+      - pdf
+      - excel
+      - word
+      - log
+      - txt
+      - zip
+    # 图片与 PDF 进入模型上下文前需脱敏
+    redactBeforeModel: true
+
+  # ------------------------------------------------------------------
+  # 回复策略
+  # ------------------------------------------------------------------
+  reply:
+    # 单条消息字数上限
+    maxChars: 100
+    # 免打扰时段：非紧急消息静默，次日汇总
+    quietHours:
+      from: "22:00"
+      to: "08:00"
+    # 同一工单同一状态不重复通知
+    dedupeByState: true
+    # 失败降级顺序
+    fallback:
+      - thread
+      - direct
+      - panel
+
+  # ------------------------------------------------------------------
+  # 卡片
+  # ------------------------------------------------------------------
+  cards:
+    submitForm: true
+    gateConfirm: true
+    question: true
+    result: true
+    # 卡片按钮回调需校验角色与授权
+    verifySignerRole: true

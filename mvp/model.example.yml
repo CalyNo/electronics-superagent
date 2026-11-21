@@ -1,0 +1,55 @@
+# ============================================================================
+# 模型网关配置（本机开发用）
+#
+# 放哪里：~/.superagent/model.yml      （Windows: C:\Users\<你>\.superagent\model.yml）
+# 为什么放主目录：密钥不进 Git、不进项目目录、不进 stateDir（docs/08 §1 三条硬规则）
+#
+# 用法：
+#   mkdir -p ~/.superagent && cp model.example.yml ~/.superagent/model.yml
+#   编辑后自检：node src/cli.mjs model --dir ./pcu24 --check
+#
+# 两种配法，按需选一种：
+#   A. 极简（一把 key，全岗位共用）——只填下面三行，或改用环境变量
+#   B. 分池（推荐）——填 pools，岗位自动落到对应池，池内失败自动换 key
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# A. 默认配置：未单独配置的池都继承这里
+# ---------------------------------------------------------------------------
+baseUrl: https://api.deepseek.com/v1
+model: deepseek-chat
+apiKey: ""                 # 或改用 apiKeyEnv: DEEPSEEK_API_KEY（推荐：值留在环境里）
+
+# ---------------------------------------------------------------------------
+# B. 密钥池：池 = 调用形态，不是"一个岗位一把 key"。
+#    岗位在代码里已绑定到池（src/executor/positions.mjs）：
+#      PM / SE / HW / PE → worker（长上下文、要强推理）
+#      QE                → doc   （质量文档，可稍慢、可用便宜的）
+#    池内多把 key 时，失败的那把会被排到后面，重试不再打回同一把。
+# ---------------------------------------------------------------------------
+pools: {}
+# pools:
+#   worker:
+#     model: deepseek-reasoner
+#     keys:
+#       - id: w1
+#         apiKeyEnv: EA_WORKER_DS_01
+#       - id: w2
+#         apiKeyEnv: EA_WORKER_DS_02
+#   doc:
+#     model: deepseek-chat
+#     apiKeyEnv: EA_DOC_DS_01
+#   router:
+#     model: deepseek-chat
+#     apiKeyEnv: EA_ROUTER_DS_01
+
+# ---------------------------------------------------------------------------
+# 预算：按工单熔断。超限后不再调模型，文档保留骨架等人填（不静默降级换模型）
+# ---------------------------------------------------------------------------
+budget:
+  tokensPerTicket: 120000
+  tokensPerDay: 2000000
+
+# 可选：超时与单次输出上限
+timeoutMs: 60000
+maxTokens: 1200

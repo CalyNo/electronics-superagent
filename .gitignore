@@ -1,0 +1,29 @@
+# ---- 运行时产物（不进仓库）----
+# 演示项目与本地验证项目：含 sqlite、工作目录、收发箱，属于本机状态
+mvp/.demo/
+mvp/pcu24/
+
+# 任意项目的运行时目录
+**/.state/
+**/.inbox/
+**/.outbox/
+**/.migration/
+
+# ---- 依赖与构建 ----
+node_modules/
+*.log
+
+# ---- 密钥与本地配置（绝不可入库）----
+# 真实密钥放在 ~/.superagent/model.yml 与 ~/.superagent/keys.json，本来就不在仓库里；
+# 这里再兜一层，防止有人把本地副本放进来
+**/model.local.yml
+**/keys.json
+.env
+.env.*
+
+# ---- 编辑器与系统 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,77 @@
+# ============================================================================
+# 项目级规则覆盖
+#
+# 铁律：本文件只能【加严】，不能【放宽】。
+#   校验器启动时比对平台基线（config/policy.example.yml），
+#   若本文件的任一有效约束弱于平台基线，实例拒绝启动并在面板报错。
+#   放宽必须改平台级策略，走质量部门审批。
+#
+# 意图：项目可以因为客户更严而多设检查，不能因为嫌麻烦而少设。
+# ============================================================================
+
+baseline: platform-2026-11          # 对齐的平台策略版本，升级后需复核
+
+stricter:
+
+  # ---- 模板与文档 ---------------------------------------------------------
+  templates:
+    required: [CHTR, SRS, APQP, FEAS]   # 本阶段强制齐套的类型
+    minSectionsFilled: 0.85             # 模板必填章节填充率下限（平台 0.8）
+    maxTodoMarkers: 5                   # 允许的"⚠ 待补充"数量上限
+    forbidStatusTransition:             # 以下状态转换必须人工触发
+      - draft->review
+      - review->released
+
+  # ---- 门禁 ---------------------------------------------------------------
+  gates:
+    G1:
+      minReviewers: 2                   # 平台默认 1
+      extraChecks:
+        - id: feasibility-signed
+          desc: 可行性分析须有工艺与质量双签
+        - id: customer-nomination
+          desc: 客户定点文件已归档
+    # G2 起按阶段启用
+
+  # ---- 执行器 -------------------------------------------------------------
+  execution:
+    maxDiffLines: 400                   # 平台 800，本项目加严
+    prepareTimeoutMin: 10
+    backgroundTimeoutMin: 30
+    allowedBranchPrefixes: ["agent/", "change/", "fix/"]   # 不开放 feature/
+    blockedCommands:                    # 在平台清单之上追加
+      - rm -rf
+      - git push --force
+      - git reset --hard                # 会丢掉未提交的现场，执行器绝不能做
+      - git rebase -i
+      - curl
+      - wget
+
+  # ---- 安全 ---------------------------------------------------------------
+  security:
+    networkPolicy: allowlist            # 默认拒绝，仅放行包管理与内网制品库
+    allowHosts:
+      - registry.npmjs.org
+      - pypi.org
+      - git.internal.example.com
+    redactPatterns:                     # 提交前扫描并阻断
+      - "(?i)api[_-]?key\\s*[=:]"
+      - "(?i)secret\\s*[=:]"
+      - "ghp_[A-Za-z0-9]{36}"
+      - "AKIA[0-9A-Z]{16}"
+
+  # ---- 预算 ---------------------------------------------------------------
+  budget:
+    perTicketLimit: 25                  # CNY，低于平台默认 30 表示更严
+    dailyLimit: 200
+
+# ---------------------------------------------------------------------------
+# 通知：只在需要人时说话，且不在休息时间吵人
+# ---------------------------------------------------------------------------
+notifications:
+  quietHours: ["22:00", "08:00"]
+  digest: daily
+  channels:
+    decisionRequired: [project-owner]
+    gatePending: [project-owner, quality]
+    failure: [platform]

@@ -1,0 +1,31 @@
+# 代码与文档责任人：决定"谁能批准这个 PR"
+# 语法：<路径模式> <责任人...>
+# 注意：占位符必须替换为真实用户或组，否则门禁形同虚设（见 docs/09 §8）
+
+# 默认兜底：项目负责人
+*                               @{{org}}/{{codeLower}}-owners
+
+# ---- 阶段目录：按 APQP 阶段路由到对应角色 ----
+/docs/S1-策划/                  @{{org}}/pm
+/docs/S2-产品设计/              @{{org}}/hw-lead
+/docs/S3-过程设计/              @{{org}}/pe
+/docs/S4-验证/                  @{{org}}/qe
+/docs/S5-量产/                  @{{org}}/qe
+/docs/_common/                  @{{org}}/{{codeLower}}-owners
+
+# ---- 平台维护区：只允许平台组改 ----
+/docs/_templates/               @{{org}}/platform
+/docs/_index/                   @{{org}}/platform
+/.superagent/                   @{{org}}/platform
+/tools/                         @{{org}}/platform
+
+# ---- 资产域 ----
+/firmware/                      @{{org}}/fw-lead
+/software/                      @{{org}}/sw-lead
+/hardware/bom/                  @{{org}}/hw-lead @{{org}}/sourcing
+/hardware/schematic/            @{{org}}/hw-lead
+/hardware/pcb/                  @{{org}}/hw-lead
+/hardware/mechanical/           @{{org}}/me-lead
+/hardware/_released/            @{{org}}/hw-lead @{{org}}/qe
+/evidence/                      @{{org}}/qe
+/test/                          @{{org}}/qe

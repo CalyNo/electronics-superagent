@@ -1,0 +1,4 @@
+# MVP 自身的产物：演示项目与依赖目录不入库
+.demo/
+node_modules/
+*.log
