@@ -21,7 +21,7 @@ rules:
       时限：D1 24h、D2 48h、D3 72h、D4 7d、D5 14d、D6 21d、D7 28d、D8 30d。
       必须识别：问题现象、影响范围、是否涉及安全件。
     match:
-      keywords: [投诉, 失效, 退货, 客诉, 不良, 批量, 异常]
+      keywords: [投诉, 客诉, 反馈, 失效, 失败, 退货, 不良, 批量, 异常, 召回, 故障, 返修, 不工作]
       taskType: quality-8d
     defaultSeverity: high
 

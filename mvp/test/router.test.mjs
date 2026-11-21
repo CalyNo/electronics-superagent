@@ -4,6 +4,9 @@ import { assess, clarifyQuestion } from '../src/domain/router.mjs';
 
 const cases = [
   ['客户投诉 PCU24 低温启动偶发失效，已退货 3 台', 'quality-8d', 'S5'],
+  // 质量问题的常见变体：客户"反馈" + "失败"，历史上会掉到 fallback-doc 变成低优先级
+  ['客户反馈 T23 串口升级到 32KB 时必失败，boot 回 CAN CAN', 'quality-8d', 'S5'],
+  ['现场返修发现模块不工作，需 8D', 'quality-8d', 'S5'],
   ['把 BOM 里的 MOS 管从 A 换成 B', 'design-change', 'S2'],
   ['产线贴片工艺参数调整，需要更新控制计划', 'process-change', 'S3'],
   ['启动 PCU30 新项目立项，客户已定点', 'project-init', 'S1'],

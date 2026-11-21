@@ -21,6 +21,10 @@ MODE="scan"
 CODE=""
 OUT=""
 STAGES="S1"
+PNAME=""
+PCUSTOMER=""
+PPLATFORM=""
+POWNER=""
 MAX_MB="50"
 WITH_GIT_INIT="0"
 DRY="0"
@@ -51,6 +55,10 @@ while [[ $# -gt 0 ]]; do
     --code)       CODE="${2:-}"; shift 2 ;;
     --out)        OUT="${2:-}"; shift 2 ;;
     --stages)     STAGES="${2:-S1}"; shift 2 ;;
+    --name)       PNAME="${2:-}"; shift 2 ;;
+    --customer)   PCUSTOMER="${2:-}"; shift 2 ;;
+    --platform)   PPLATFORM="${2:-}"; shift 2 ;;
+    --owner)      POWNER="${2:-}"; shift 2 ;;
     --max-mb)     MAX_MB="${2:-50}"; shift 2 ;;
     --git-init)   WITH_GIT_INIT="1"; shift ;;
     --dry-run)    DRY="1"; shift ;;
@@ -86,7 +94,11 @@ csvq() {
   esac
 }
 
-rel() { printf '%s' "${1#"$SRC"/}"; }
+# rel 同时把结果写入 REL_RESULT（调用方可用 "${REL_RESULT}" 免开子进程）
+rel() {
+  REL_RESULT="${1#"$SRC"/}"
+  printf '%s' "$REL_RESULT"
+}
 
 # 迁移产物（映射建议、sidecar 草案）不属于项目资产：写入 info/exclude，
 # 既不进基线提交，也不去污染项目自己的 .gitignore
@@ -98,13 +110,16 @@ exclude_migration() {
   fi
   printf '.migration/\n' >> "$excl"
 }
+# 大小写折叠用 bash 4+ 的内建 ${var,,}/${var^^}，避免每个文件 fork 一次 tr。
+# 分类规则的输出与原先的 `tr '[:upper:]' '[:lower:]'` 完全一致（ASCII 文件名）。
 extract_rev() {
   local b
-  b="$(basename "$1")"
+  b="${1##*/}"
   if [[ "$b" =~ [vV]([0-9]+(\.[0-9]+)*) ]]; then
     printf 'v%s' "${BASH_REMATCH[1]}"
   elif [[ "$b" =~ [Rr][Ee][Vv][[:space:]_.-]?([A-Za-z])([^A-Za-z]|$) ]]; then
-    printf 'Rev%s' "$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')"
+    local u="${BASH_REMATCH[1]}"
+    printf 'Rev%s' "${u^^}"
   elif [[ "$b" =~ ([A-Z])版 ]]; then
     printf 'Rev%s' "${BASH_REMATCH[1]}"
   else
@@ -113,21 +128,24 @@ extract_rev() {
 }
 
 is_binary_doc() {
-  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+  local l="${1,,}"
+  case "$l" in
     *.pdf|*.doc|*.docx|*.xls|*.xlsx|*.ppt|*.pptx|*.vsd|*.vsdx) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 is_hw_binary() {
-  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+  local l="${1,,}"
+  case "$l" in
     *.schdoc|*.pcbdoc|*.sch|*.pcb|*.gbr|*.gerber|*.step|*.stp|*.igs|*.iges|*.dwg|*.dxf|*.zip) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 is_code() {
-  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+  local l="${1,,}"
+  case "$l" in
     *.c|*.h|*.cc|*.cpp|*.hpp|*.s|*.asm|*.ld|*.py|*.js|*.ts|*.cs|*.java|*.go|*.rs) return 0 ;;
     *) return 1 ;;
   esac
@@ -138,54 +156,67 @@ is_code() {
 #   kind = doc / hw / code / unknown
 # 规则见 docs/10 §4 P3 的判定表；项目专属关键词可通过 taxonomy.yml 后续扩展
 # ---------------------------------------------------------------------------
+# classify 把结果同时写入全局 CLS_RESULT，并照旧打印（保持向后兼容）。
+# 热循环用 `classify "$f" >/dev/null; r="$CLS_RESULT"` 复用同进程结果，省去每文件一次 fork。
 classify() {
-  local base lower hit
-  base="$(basename "$1")"
-  lower="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
+  local base lower hit cls
+  base="${1##*/}"                       # 等价于 basename "$1"，无子进程
+  lower="${base,,}"                     # 等价于 tr '[:upper:]' '[:lower:]'，无子进程
   hit() { case "$lower" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+  # hitw：短英文缩写必须按"分隔符边界"匹配，否则 spc 会命中 spcp.c、eco 会命中 Recorder。
+  # 中文关键词与长描述词仍走 hit（子串），因为中文没有空格分词。
+  hitw() {
+    local k="$1"
+    case "$lower" in
+      "$k"|"$k"[!a-z0-9]*|*[!a-z0-9]"$k"|*[!a-z0-9]"$k"[!a-z0-9]*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
 
   # --- 文档：先匹配长关键词，避免短词误命中 ---
-  if   hit "dfmea"                            ; then echo "doc|S2-产品设计|DFMEA|S2|high"
-  elif hit "pfmea"                            ; then echo "doc|S3-过程设计|PFMEA|S3|high"
+  if   hit "dfmea"                            ; then cls="doc|S2-产品设计|DFMEA|S2|high"
+  elif hit "pfmea"                            ; then cls="doc|S3-过程设计|PFMEA|S3|high"
   elif hit "control_plan" || hit "control plan" || hit "控制计划" \
-       || hit "controlplan" || hit "-cp-" || hit "_cp_" ; then echo "doc|S3-过程设计|CP|S3|high"
-  elif hit "流程图" || hit "pfc" || hit "process_flow" ; then echo "doc|S3-过程设计|PFC|S3|high"
-  elif hit "msa" || hit "gage" || hit "grr"   ; then echo "doc|S4-验证|MSA|S4|high"
-  elif hit "spc" || hit "cpk" || hit "ppk" || hit "过程能力" ; then echo "doc|S4-验证|SPC|S4|high"
-  elif hit "ppap" || hit "psw"                ; then echo "doc|S4-验证|PPAP|S4|high"
-  elif hit "8d"                               ; then echo "doc|S5-量产|8D|S5|high"
-  elif hit "ecn" || hit "eco" || hit "pcn" || hit "变更通知" ; then echo "doc|S5-量产|ECN|S5|high"
-  elif hit "sor" || hit "rfq" || hit "srs" || hit "技术要求" || hit "客户规范" ; then echo "doc|S1-策划|SRS|S1|high"
-  elif hit "章程" || hit "charter"            ; then echo "doc|S1-策划|CHTR|S1|high"
-  elif hit "apqp" || hit "项目计划" || hit "timing" ; then echo "doc|S1-策划|APQP|S1|high"
-  elif hit "可行性" || hit "feasibility"      ; then echo "doc|S1-策划|FEAS|S1|medium"
-  elif hit "dvp" || hit "验证计划"            ; then echo "doc|S2-产品设计|DVP|S2|high"
-  elif hit "特殊特性" || hit "关键特性" || hit "cc_sc" ; then echo "doc|S2-产品设计|SC|S2|medium"
-  elif hit "试产" || hit "试作" || hit "pilot" || hit "run@rate" ; then echo "doc|S4-验证|TR|S4|medium"
+       || hit "controlplan" || hit "-cp-" || hit "_cp_" ; then cls="doc|S3-过程设计|CP|S3|high"
+  elif hit "流程图" || hitw "pfc" || hit "process_flow" ; then cls="doc|S3-过程设计|PFC|S3|high"
+  elif hitw "msa" || hitw "gage" || hitw "grr" ; then cls="doc|S4-验证|MSA|S4|high"
+  elif hitw "spc" || hitw "cpk" || hitw "ppk" || hit "过程能力" ; then cls="doc|S4-验证|SPC|S4|high"
+  elif hitw "ppap" || hitw "psw"               ; then cls="doc|S4-验证|PPAP|S4|high"
+  elif hitw "8d"                              ; then cls="doc|S5-量产|8D|S5|high"
+  elif hitw "ecn" || hitw "eco" || hitw "pcn" || hit "变更通知" ; then cls="doc|S5-量产|ECN|S5|high"
+  elif hitw "sor" || hitw "rfq" || hitw "srs" || hit "技术要求" || hit "客户规范" ; then cls="doc|S1-策划|SRS|S1|high"
+  elif hit "章程" || hit "charter"            ; then cls="doc|S1-策划|CHTR|S1|high"
+  elif hit "apqp" || hit "项目计划" || hit "timing" ; then cls="doc|S1-策划|APQP|S1|high"
+  elif hit "可行性" || hit "feasibility"      ; then cls="doc|S1-策划|FEAS|S1|medium"
+  elif hitw "dvp" || hit "验证计划"            ; then cls="doc|S2-产品设计|DVP|S2|high"
+  elif hit "特殊特性" || hit "关键特性" || hit "cc_sc" ; then cls="doc|S2-产品设计|SC|S2|medium"
+  elif hit "试产" || hit "试作" || hit "pilot" || hit "run@rate" ; then cls="doc|S4-验证|TR|S4|medium"
 
   # --- 硬件 ---
-  elif hit "bom"                              ; then echo "hw|hardware/bom|bom||high"
-  elif hit "原理图" || hit "schematic" || hit "schdoc" ; then echo "hw|hardware/schematic|schematic||high"
-  elif hit "pcb" || hit "gerber"               ; then echo "hw|hardware/pcb|pcb||high"
-  elif hit "工装" || hit "治具" || hit "夹具" || hit "fixture" ; then echo "hw|hardware/fixture|fixture||medium"
-  elif hit "datasheet" || hit "器件手册" || hit "规格书" ; then echo "hw|hardware/datasheet|datasheet||medium"
-  elif hit "结构" || hit "外壳" || hit "mechanical" ; then echo "hw|hardware/mechanical|mechanical||medium"
+  elif hitw "bom"                             ; then cls="hw|hardware/bom|bom||high"
+  elif hit "原理图" || hit "schematic" || hit "schdoc" ; then cls="hw|hardware/schematic|schematic||high"
+  elif hitw "pcb" || hit "gerber"              ; then cls="hw|hardware/pcb|pcb||high"
+  elif hit "工装" || hit "治具" || hit "夹具" || hit "fixture" ; then cls="hw|hardware/fixture|fixture||medium"
+  elif hit "datasheet" || hit "器件手册" || hit "规格书" ; then cls="hw|hardware/datasheet|datasheet||medium"
+  elif hit "结构" || hit "外壳" || hit "mechanical" ; then cls="hw|hardware/mechanical|mechanical||medium"
 
   # --- 二进制硬件（靠扩展名兜底）---
-  elif is_hw_binary "$base"                    ; then echo "hw|hardware|misc||medium"
+  elif is_hw_binary "$base"                    ; then cls="hw|hardware|misc||medium"
 
   # --- 代码 ---
   elif is_code "$base"                         ; then
     case "$lower" in
-      *.py|*.js|*.ts|*.cs|*.java) echo "code|software|src||medium" ;;
-      *)                          echo "code|firmware|src||high" ;;
+      *.py|*.js|*.ts|*.cs|*.java) cls="code|software|src||medium" ;;
+      *)                          cls="code|firmware|src||high" ;;
     esac
 
   # --- 二进制文档：只能靠扩展名，需要人工定位阶段 ---
-  elif is_binary_doc "$base"                   ; then echo "doc|||unknown|low"
+  elif is_binary_doc "$base"                   ; then cls="doc|||unknown|low"
 
-  else echo "unknown|||unknown|low"
+  else cls="unknown|||unknown|low"
   fi
+  CLS_RESULT="$cls"
+  printf '%s' "$cls"
 }
 
 # ---------------------------------------------------------------------------
@@ -196,7 +227,7 @@ do_scan() {
 
   while IFS= read -r -d '' f; do
     total=$((total + 1))
-    local r; r="$(classify "$f")"
+    classify "$f" >/dev/null; local r="$CLS_RESULT"
     case "$r" in
       doc*high*)     dhigh=$((dhigh + 1)) ;;
       doc*medium*)   dmed=$((dmed + 1)) ;;
@@ -287,16 +318,16 @@ do_plan() {
   while IFS= read -r -d '' f; do
     local r kind target type stage conf rp id
     # 版本控制与平台元文件不是可追溯资产，不进映射表（也不进债务台账）
-    case "$(basename "$f")" in
+    case "${f##*/}" in
       .gitignore|.gitattributes|.gitmodules|.editorconfig|.DS_Store|*.meta.yml)
         n_meta=$((n_meta + 1)); continue ;;
     esac
-    r="$(classify "$f")"
+    classify "$f" >/dev/null; r="$CLS_RESULT"
     kind="${r%%|*}";   r="${r#*|}"
     target="${r%%|*}"; r="${r#*|}"
     type="${r%%|*}";   r="${r#*|}"
     stage="${r%%|*}";  conf="${r#*|}"
-    rp="$(rel "$f")"
+    rel "$f" >/dev/null; rp="$REL_RESULT"
 
     case "$kind" in
       doc)
@@ -312,7 +343,7 @@ do_plan() {
         id="$(printf 'DOC-%s-%s-%03d' "$stage" "$type" "${SEQ[$key]}")"
         # 同名文件通常意味着多版本共存：不删除，提示人工判定权威版本
         local b bnote
-        b="$(basename "$f")"
+        b="${f##*/}"
         if [[ -n "${SEEN[$b]:-}" ]]; then
           bnote="与 ${SEEN[$b]} 同名，疑似多版本，确认后标 obsolete 指向权威版本"
         elif [[ "$conf" == "high" ]]; then
@@ -423,6 +454,10 @@ do_apply() {
     log "初始化 Git 并做 as-is 快照提交"
     [[ $DRY -eq 0 ]] && {
       git -C "$SRC" init -q -b main 2>/dev/null || git -C "$SRC" init -q
+      # 仓库级身份：不依赖全局 git config，避免快照提交因缺 user.name/email 失败。
+      # 与 mvp/app/bootstrap.mjs 的取值保持一致。
+      git -C "$SRC" config user.name "electronics-superagent"
+      git -C "$SRC" config user.email "agent@example.com"
       exclude_migration
       git -C "$SRC" add -A
       git -C "$SRC" commit -q -m "chore(migration): ${CODE} 存量快照（原样，未整理）" \
@@ -473,9 +508,20 @@ do_apply() {
     if [[ ! -e "$mdst" ]]; then
       log "新增：.superagent/manifest.yml（code=$CODE, stages=[$STAGES]）"
       [[ $DRY -eq 0 ]] && {
-        local en_yaml
+        local en_yaml name customer platform owner code_lower
         en_yaml="[$(printf '%s' "$STAGES" | sed 's/,/, /g')]"
+        name="${PNAME:-$CODE}"
+        customer="${PCUSTOMER:--}"
+        platform="${PPLATFORM:-${CODE:0:3}}"
+        owner="${POWNER:--}"
+        code_lower="$(printf '%s' "$CODE" | tr '[:upper:]' '[:lower:]')"
+        # 与 mvp/app/bootstrap.mjs 的占位符集合保持一致，避免遗留 {{NAME}} 之类的空模板
         sed -e "s/{{CODE}}/${CODE}/g" \
+            -e "s/{{codeLower}}/${code_lower}/g" \
+            -e "s/{{NAME}}/${name}/g" \
+            -e "s/{{CUSTOMER}}/${customer}/g" \
+            -e "s/{{PLATFORM}}/${platform}/g" \
+            -e "s/{{OWNER_NAME}}/${owner}/g" \
             -e "s|^  enabled: .*|  enabled: ${en_yaml}                    # 按 APQP 实际进度增加，须与 docs/ 下已建阶段一致|" \
             "$mtpl" > "$mdst"
         printf '%s\n' ".superagent/manifest.yml" >> "$manifest"

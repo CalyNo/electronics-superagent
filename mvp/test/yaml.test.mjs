@@ -12,7 +12,7 @@ test('YAML：解析真实策略文件', () => {
   const p = parseYaml(read('config/policy.example.yml'), { file: 'policy' });
   assert.equal(p.acceptMode, 'observe');
   assert.equal(p.rules.length, 5);
-  assert.deepEqual(p.rules[0].match.keywords, ['投诉', '失效', '退货', '客诉', '不良', '批量', '异常']);
+  assert.deepEqual(p.rules[0].match.keywords, ['投诉', '客诉', '反馈', '失效', '失败', '退货', '不良', '批量', '异常', '召回', '故障', '返修', '不工作']);
   // 块标量保留换行
   assert.match(p.rules[0].instruction, /\n/);
   // 行内列表

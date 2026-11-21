@@ -13,6 +13,7 @@ import { runGateChecks } from './domain/gate.mjs';
 import { STAGES, DOC_TYPES } from './domain/stages.mjs';
 import { classify, checkPlacement } from './executor/asset-router.mjs';
 import { walk, exists, readFileSafe, rel } from './util/fsx.mjs';
+import { parseCsv } from './util/csv.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -256,10 +257,47 @@ async function cmdGate(args) {
   }
 }
 
+/**
+ * 存量迁移校验模式（docs/10 §4 P5）：
+ *  strict 任何错位都失败（新建项目默认）
+ *  legacy 只有 import-map.csv 已登记的存量件被豁免落位，其余按 strict；未登记件告警不失败
+ *  report 全部只告警不失败
+ *  auto（默认）存在 import-map.csv 时选 legacy，否则 strict
+ */
+async function resolveVerifyMode(args, dir) {
+  const requested = args.mode === true ? 'auto' : args.mode;
+  if (requested && !['strict', 'legacy', 'report', 'auto'].includes(requested)) {
+    console.error(`${NO()} --mode 非法：${requested}（可选 strict|legacy|report|auto）`);
+    process.exit(2);
+  }
+  if (requested && requested !== 'auto') return requested;
+  // scaffold 给新项目也放了一份空 import-map.csv，只有含数据行的才代表"存量迁移项目"
+  const mapFile = path.join(dir, 'docs/_index/import-map.csv');
+  if (!(await exists(mapFile))) return 'strict';
+  const rows = parseCsv(await readFileSafe(mapFile, ''));
+  return rows.length > 1 ? 'legacy' : 'strict';
+}
+
+async function loadLegacyPaths(dir) {
+  const mapFile = path.join(dir, 'docs/_index/import-map.csv');
+  if (!(await exists(mapFile))) return new Set();
+  const rows = parseCsv(await readFileSafe(mapFile, ''));
+  const set = new Set();
+  for (const r of rows.slice(1)) {
+    const p = r[0];
+    if (p) set.add(String(p).replace(/\\/g, '/'));
+  }
+  return set;
+}
+
 async function cmdVerify(args) {
   const dir = path.resolve(need(args, 'dir', 'verify 需要 --dir'));
+  const mode = await resolveVerifyMode(args, dir);
+  const legacyPaths = mode === 'legacy' || mode === 'report' ? await loadLegacyPaths(dir) : new Set();
   const problems = [];
-  const checked = { docs: 0, files: 0, gates: 0 };
+  const warnings = [];
+  const checked = { docs: 0, files: 0, gates: 0, legacyExempt: 0 };
+  const addIssue = (msg) => (mode === 'strict' ? problems : warnings).push(msg);
 
   const project = await loadProject(dir);
   const { policy, errors: policyErrors } = await loadPolicy(
@@ -280,21 +318,28 @@ async function cmdVerify(args) {
     const parts = relPath.split('/');
     const stage = String(parts[1] ?? '').slice(0, 2);
     const type = parts[2] ?? '';
-    if (!STAGES[stage] || !DOC_TYPES[type]) { problems.push(`${relPath}：路径不符合 docs/<阶段>/<类型>/ 约定`); continue; }
+    if (!STAGES[stage] || !DOC_TYPES[type]) { addIssue(`${relPath}：路径不符合 docs/<阶段>/<类型>/ 约定`); continue; }
     const text = await readFileSafe(f, '');
     const v = validateDoc({ text, relPath, rules, expect: { stage, type, project: project.manifest.code } });
     checked.docs += 1;
-    if (!v.ok) problems.push(`${relPath}：${v.errors.join('；')}`);
+    if (!v.ok) addIssue(`${relPath}：${v.errors.join('；')}`);
   }
 
-  // 资产落位
+  // 资产落位：legacy/report 模式下，import-map 已登记的存量件按 docs/10 §4 P5 豁免
   const allFiles = await walk(dir, { filter: (p) => !p.includes(`${path.sep}.git${path.sep}`) });
   for (const f of allFiles) {
     const relPath = rel(dir, f);
     if (relPath.startsWith('docs/') || relPath.startsWith('.superagent/') || relPath.startsWith('.state/')) continue;
     const c = checkPlacement(relPath);
     checked.files += 1;
-    if (!c.ok) problems.push(`${relPath}：${c.reason}`);
+    if (!c.ok) {
+      if (legacyPaths.has(relPath)) {
+        checked.legacyExempt += 1;
+        warnings.push(`${relPath}：存量件落位豁免（import-map 已登记）— ${c.reason}`);
+      } else {
+        addIssue(`${relPath}：${c.reason}`);
+      }
+    }
   }
 
   // 门禁：只检查"已开工"的阶段。项目在 S1 时 S2 无交付物属正常，不是问题
@@ -310,15 +355,20 @@ async function cmdVerify(args) {
       if (allMissing) { notStarted += 1; continue; }
       if (res.status !== 'pending') {
         const gaps = res.checks.filter((c) => !c.ok && !c.skipped);
-        if (gaps.length) problems.push(`${gateId}：${gaps.map((c) => c.detail).join('；')}`);
+        if (gaps.length) addIssue(`${gateId}：${gaps.map((c) => c.detail).join('；')}`);
       }
     } catch (err) {
-      problems.push(`${gateId}：${err.message}`);
+      addIssue(`${gateId}：${err.message}`);
     }
   }
 
-  console.log(`${C.bold('校验')} ${dir}`);
-  console.log(`  文档 ${checked.docs} 份 · 文件 ${checked.files} 个 · 门禁 ${checked.gates} 个${notStarted ? `（${notStarted} 个阶段未启动，跳过）` : ''}`);
+  console.log(`${C.bold('校验')} ${dir}  ${C.dim(`[${mode}]`)}`);
+  console.log(`  文档 ${checked.docs} 份 · 文件 ${checked.files} 个 · 门禁 ${checked.gates} 个${notStarted ? `（${notStarted} 个阶段未启动，跳过）` : ''}${checked.legacyExempt ? ` · 存量豁免 ${checked.legacyExempt}` : ''}`);
+  if (warnings.length) {
+    console.log(`  ${C.yellow('⚠')} ${warnings.length} 项告警（不阻断）`);
+    for (const w of warnings.slice(0, 10)) console.log(`    · ${w}`);
+    if (warnings.length > 10) console.log(C.dim(`    …另有 ${warnings.length - 10} 项告警`));
+  }
   if (!problems.length) {
     console.log(`  ${OK()} 全部通过`);
     return 0;
@@ -485,7 +535,7 @@ async function cmdHelp() {
   tickets   列出工单；--id 看单张全链路
   gate      list | check <G> | sign <G> --as <open_id> | return <G> --as <open_id>
   model     查看模型网关配置（--dir --file），--check 发一条最小请求自检
-  verify    全量校验：配置、文档结构、资产落位、门禁
+  verify    全量校验：配置、文档结构、资产落位、门禁（--mode strict|legacy|report|auto）
   classify  查看文件会落到哪个目录
   demo      跑一遍三条场景（自动建 .demo/PCU24）
 
