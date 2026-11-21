@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { makeRuntime, say, cleanup } from './helpers.mjs';
 import { createPanelServer } from '../src/panel/server.mjs';
+import { POSITIONS } from '../src/executor/positions.mjs';
 
 // 工作台的价值在于"一眼看清谁在干什么、产出了什么"，所以测的是视图字段是否真的对得上库里的状态
 
@@ -29,7 +30,7 @@ async function boot(t, opts = {}) {
   return { dir, runtime, url, get };
 }
 
-test('工作台：结构完整，岗位 5 个、队列与工单一致', async (t) => {
+test('工作台：结构完整，岗位齐全、队列与工单一致', async (t) => {
   const { runtime, get, dir } = await boot(t);
   await say(dir, { id: 'wb-1', actor: 'ou_xxx2', text: '客户投诉 低温启动偶发失效' });
   await runtime.tick();
@@ -38,8 +39,8 @@ test('工作台：结构完整，岗位 5 个、队列与工单一致', async (t
   assert.equal(r.status, 200);
   const w = r.body;
   assert.equal(w.project.code, 'TST01');
-  assert.equal(w.positions.length, 5);
-  assert.deepEqual(w.positions.map((p) => p.code).sort(), ['HW', 'PE', 'PM', 'QE', 'SE']);
+  assert.equal(w.positions.length, Object.keys(POSITIONS).length);
+  assert.deepEqual(w.positions.map((p) => p.code).sort(), Object.keys(POSITIONS).sort());
   assert.equal(w.queue.review, 1, '跑完的工单应计入待评审');
   assert.equal(w.queue.working, 0);
   assert.ok(w.gates.length >= 1);

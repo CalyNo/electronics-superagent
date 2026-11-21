@@ -22,6 +22,16 @@ test('岗位：一个岗位可负责多类文档，一张工单可能跨岗位',
   assert.deepEqual(positionsForDocs(['8D', 'DFMEA', 'CHTR']).sort(), ['HW', 'PM', 'QE']);
 });
 
+test('岗位：测试报告由 TE 负责，提示词写明 Word 交付与 IATF 要素硬要求', () => {
+  assert.equal(positionForDoc('TEST').code, 'TE');
+  const p = POSITIONS.TE;
+  assert.match(p.systemPrompt, /\.docx/);
+  assert.match(p.systemPrompt, /禁止/);
+  assert.match(p.systemPrompt, /校准/);
+  assert.match(p.systemPrompt, /待确认/);
+  assert.deepEqual(p.docTypes, ['TEST']);
+});
+
 test('岗位：每个岗位都绑定了池，且池名在允许集合内', () => {
   const allowed = new Set(['router', 'worker', 'doc', 'vision']);
   for (const p of Object.values(POSITIONS)) {

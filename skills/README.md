@@ -13,6 +13,7 @@
 | `iatf-msa` | 测量系统分析 | GRR 设计、计算、判定 |
 | `iatf-spc` | 过程能力 | Cpk/Ppk、控制图选择 |
 | `iatf-ppap` | PPAP | 18 项要素、提交等级、PSW |
+| `iatf-test-report` | 测试报告 | Word 交付格式、报告版式、IATF 必备要素 |
 | `iatf-apqp` | 项目策划 | 五阶段、交付物、阶段门 |
 | `ecn` | 变更管理 | 影响分析、分级、审批 |
 | `repo-ops` | 仓库操作 | 分支、提交、PR、校验 |
