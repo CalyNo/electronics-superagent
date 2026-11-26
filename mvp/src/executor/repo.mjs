@@ -10,15 +10,16 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { ensureDir, exists, readFileSafe } from '../util/fsx.mjs';
 
-function git(args, cwd, { allowFail = false } = {}) {
+function git(args, cwd, { allowFail = false, rawStdout = false } = {}) {
   return new Promise((resolve, reject) => {
-    execFile('git', args, { cwd, timeout: 30000, windowsHide: true }, (err, stdout, stderr) => {
+    const child = execFile('git', args, { cwd, timeout: 30000, windowsHide: true }, (err, stdout, stderr) => {
       if (err && !allowFail) {
         err.message = `git ${args.join(' ')} 失败：${(stderr || stdout || err.message).trim()}`;
         return reject(err);
       }
-      resolve({ ok: !err, code: err?.code ?? 0, stdout: String(stdout ?? '').trim(), stderr: String(stderr ?? '').trim() });
+      resolve({ ok: !err, code: err?.code ?? 0, stdout: rawStdout ? stdout : stdout.trim(), stderr: stderr.trim() });
     });
+    child.stdin.end();
   });
 }
 
@@ -73,12 +74,17 @@ export async function createBranch(dir, branch, { protectedList, allowedPrefixes
 
 /** 切回基线分支：受保护分支只读操作，不提交 */
 export async function checkoutBase(dir, candidates = ['develop', 'main', 'master']) {
+  let checkoutError = null;
   for (const b of candidates) {
-    const r = await git(['rev-parse', '--verify', '--quiet', b], dir, { allowFail: true });
-    if (!r.ok) continue;
-    await git(['checkout', '-q', b], dir, { allowFail: true });
-    return b;
+    if (!(await branchExists(dir, b))) continue;
+    try {
+      await git(['checkout', '-q', b], dir);
+      return b;
+    } catch (err) {
+      checkoutError = err;
+    }
   }
+  if (checkoutError) throw checkoutError;
   return null;
 }
 
@@ -90,21 +96,98 @@ export async function checkoutBranch(dir, branch) {
   return (await git(['checkout', '-q', branch], dir, { allowFail: true })).ok;
 }
 
+function relativePaths(dir, files) {
+  return [...new Set(files.map((file) => path.relative(dir, file).split(path.sep).join('/')).filter(Boolean))];
+}
+
+function nulSeparated(output) {
+  return output.split('\0').filter(Boolean);
+}
+
+export async function hasTrackedChanges(dir, files) {
+  const rels = relativePaths(dir, files);
+  if (!rels.length) return false;
+  const { stdout } = await git(
+    ['--literal-pathspecs', 'status', '--porcelain=v1', '--untracked-files=no', '--no-renames', '-z', '--', ...rels],
+    dir, { rawStdout: true },
+  );
+  return stdout.length > 0;
+}
+
+async function untrackedPaths(dir, rels) {
+  const { stdout } = await git(
+    ['--literal-pathspecs', 'ls-files', '--others', '--exclude-standard', '-z', '--', ...rels],
+    dir, { rawStdout: true },
+  );
+  return nulSeparated(stdout);
+}
+
+async function restoreIntents(dir, paths) {
+  const { stdout } = await git(
+    ['--literal-pathspecs', 'diff', '--no-renames', '--name-only', '--diff-filter=A', '-z', '--', ...paths],
+    dir, { rawStdout: true },
+  );
+  const pending = nulSeparated(stdout);
+  if (pending.length) await git(['update-index', '--force-remove', '--', ...pending], dir);
+}
+
 /** 提交指定文件；返回 {sha, branch, files} */
-export async function commitFiles(dir, files, message, { author }) {
-  const rels = files.map((f) => path.relative(dir, f)).filter(Boolean);
+export async function commitFiles(dir, files, message, { author } = {}) {
+  const rels = relativePaths(dir, files);
   if (!rels.length) return { sha: null, branch: await currentBranch(dir), files: [] };
-  await git(['add', '--', ...rels], dir);
-  const args = ['commit', '-q', '-m', message];
+  const untracked = await untrackedPaths(dir, rels);
+  const args = ['--literal-pathspecs', 'commit', '--only', '-q', '-m', message];
   if (author?.name && author?.email) args.push('--author', `${author.name} <${author.email}>`);
-  const r = await git(args, dir, { allowFail: true });
-  if (!r.ok) {
-    const status = await git(['status', '--porcelain'], dir, { allowFail: true });
-    if (!status.stdout) return { sha: null, branch: await currentBranch(dir), files: rels };
-    throw new Error(`提交失败：${r.stderr || r.stdout}`);
+
+  let committed = false;
+  try {
+    // Git 的部分提交需要在索引中识别新路径，意向条目避免暂存文件内容。
+    if (untracked.length) await git(['--literal-pathspecs', 'add', '-N', '--', ...untracked], dir);
+    const preview = await git(
+      ['--literal-pathspecs', 'commit', '--only', '--dry-run', '--porcelain', '--branch', '-uno', '--', ...rels],
+      dir, { allowFail: true },
+    );
+    if (!preview.ok) {
+      // 状态输出的分支行区分了无改动和 Git 在生成状态之前拒绝了提交。
+      if (preview.code === 1 && preview.stdout.startsWith('## ')) {
+        return { sha: null, branch: await currentBranch(dir), files: rels };
+      }
+      throw new Error(`提交预检失败：${preview.stderr || preview.stdout}`);
+    }
+    const result = await git([...args, '--', ...rels], dir, { allowFail: true });
+    if (!result.ok) throw new Error(`提交失败：${result.stderr || result.stdout}`);
+    committed = true;
+  } finally {
+    if (!committed && untracked.length) await restoreIntents(dir, untracked);
   }
-  const sha = (await git(['rev-parse', '--short', 'HEAD'], dir, { allowFail: true })).stdout;
+  const { stdout: sha } = await git(['rev-parse', '--short', 'HEAD'], dir);
   return { sha, branch: await currentBranch(dir), files: rels };
+}
+
+function countDiffLines(output) {
+  return output.split('\0').reduce((sum, entry) => {
+    const [add, del] = entry.split('\t', 2);
+    return sum + (Number(add) || 0) + (Number(del) || 0);
+  }, 0);
+}
+
+/** 统计指定工作树路径相对 HEAD 的增删行数，包含尚未跟踪的新文件。 */
+export async function workingDiffLines(dir, files) {
+  const rels = relativePaths(dir, files);
+  if (!rels.length) return 0;
+  const head = await git(['rev-parse', '--verify', '--quiet', 'HEAD'], dir, { allowFail: true });
+  const base = head.ok ? head.stdout : (await git(['hash-object', '-t', 'tree', '--stdin'], dir)).stdout;
+  const diffOptions = ['--no-ext-diff', '--no-textconv', '--no-renames', '--numstat', '-z'];
+  const tracked = await git(['--literal-pathspecs', 'diff', ...diffOptions, base, '--', ...rels], dir);
+  let lines = countDiffLines(tracked.stdout);
+  for (const file of await untrackedPaths(dir, rels)) {
+    const diff = await git(['diff', '--no-index', ...diffOptions, '--', '/dev/null', file], dir, { allowFail: true });
+    if (!diff.ok && (diff.code !== 1 || !diff.stdout)) {
+      throw new Error(`读取 ${file} 的改动失败：${diff.stderr || diff.stdout}`);
+    }
+    lines += countDiffLines(diff.stdout);
+  }
+  return lines;
 }
 
 export async function stagedDiffLines(dir) {

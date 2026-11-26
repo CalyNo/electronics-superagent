@@ -2,7 +2,7 @@
 // MVP 用有序关键词规则（docs/02 §3.1），命中即停；规则顺序本身就是优先级。
 // 判不出来时返回 clarify —— 这是设计内行为：宁可问一句，不猜。
 
-import { DOC_TYPES, TASK_PLANS, planFor } from './stages.mjs';
+import { DOC_TYPES, STAGE_ORDER, TASK_PLANS, planFor } from './stages.mjs';
 
 // 顺序敏感：越具体的规则越靠前，避免"产线参数变更"被判成设计变更
 const RULES = [
@@ -10,7 +10,7 @@ const RULES = [
     // 固件代码改动优先于设计变更：否则"改固件实现双击配对"会先被 design-change 的"改/增加"命中
     taskType: 'code-change',
     id: 'rule-code-change',
-    keywords: ['改固件', '改代码', '写固件', '固件实现', '代码实现', 'firmware', '烧录代码', '固件代码'],
+    keywords: ['改固件', '改代码', '写固件', '固件实现', '代码实现', '烧录代码', '固件代码', '固件修改', '固件变更', '更新固件'],
     reason: '命中固件代码关键词 → 走 code-change，由软件工程师(SW)修改 firmware/ 应用代码',
   },
   {
@@ -75,6 +75,30 @@ const DOC_HINTS = [
 const HIGH_RISK = ['安全件', '安全', '法规', '召回', '客户特殊特性', '功能安全', 'asil'];
 const MID_RISK = ['特殊特性', '关键特性', '重要特性'];
 
+const APP_PATH = /^(?:firmware\/(?:ble\/)?app\/|T23\/projects\/[^/]+\/ble\/app\/).+\.[ch]$/i;
+const DENIED_CODE_DIR = /^(?:sdk|cmsis|ble_library|n32wb03x_std_periph_driver|middlewares?|boot(?:loader)?|mdk-arm|objects|listings)$/i;
+const CHANGE_ACTION = /改|替换|新增|添加|修复|实现|调整|更新|\b(?:edit|modify|change|fix|implement|update|patch)\b/i;
+const FIRMWARE_ACTION = /\bfirmware\s+(?:changes?|updates?|patch)\b|\b(?:edit|modify|change|update|patch)\s+(?:the\s+)?firmware\b/i;
+const QUALITY_REPORT = /(?:出|开|提交|生成|提供|补写|制作|开展|走|要)\s*(?:一[份张个]\s*)?8d\b/i;
+
+export function isFirmwareApplicationPath(relPath) {
+  if (!APP_PATH.test(relPath)) return false;
+  const parts = relPath.split('/');
+  return parts.every((part) => /^[\p{L}\p{N}_. -]+$/u.test(part) && !/[. ]$/.test(part))
+    && !parts.slice(0, -1).some((part) => DENIED_CODE_DIR.test(part));
+}
+
+function pickCodeTargets(requirement) {
+  const text = requirement.replace(/\\/g, '/');
+  const paths = new Set();
+  const candidates = text.matchAll(/`([^`\r\n]+)`|"([^"\r\n]+)"|(?<![\w./:-])(?:firmware\/|T23\/projects\/)[\p{L}\p{N}_.\/-]+\.[ch](?![\p{L}\p{N}_/-]|\.[\p{L}\p{N}_-])/giu);
+  for (const [match, backticked, quoted] of candidates) {
+    const relPath = backticked ?? quoted ?? match;
+    if (isFirmwareApplicationPath(relPath)) paths.add(relPath);
+  }
+  return [...paths].map((relPath) => ({ relPath, requirement }));
+}
+
 function norm(s) {
   return String(s || '').toLowerCase();
 }
@@ -86,6 +110,10 @@ function pickDocTypes(text) {
     if (h.words.some((w) => t.includes(w))) found.push(h.type);
   }
   return [...new Set(found)];
+}
+
+function stageForDocuments(docTypes) {
+  return STAGE_ORDER.findLast((stage) => docTypes.some((type) => DOC_TYPES[type].stage === stage));
 }
 
 function riskOf(text, severity) {
@@ -101,10 +129,12 @@ function titleOf(text) {
 }
 
 /**
- * @returns {{taskType,stage,gateTarget,docTypes,severity,riskLevel,title,reason,ruleId,confidence,missing?}}
+ * @returns {{taskType,stage,gateTarget,docTypes,severity,riskLevel,title,reason,ruleId,confidence,missing?,codeTargets?}}
  */
 export function assess({ text, policyRules = [], defaultStage = 'S1' }) {
   const t = norm(text);
+  const codeTargets = pickCodeTargets(String(text ?? ''));
+  const qualityReport = QUALITY_REPORT.test(t);
   const severityOverride = new Map(
     (policyRules ?? [])
       .filter((r) => r?.match?.taskType)
@@ -112,8 +142,21 @@ export function assess({ text, policyRules = [], defaultStage = 'S1' }) {
   );
 
   for (const rule of RULES) {
-    const hit = rule.keywords.some((k) => t.includes(norm(k)));
+    const isCode = rule.taskType === 'code-change';
+    const keywordHit = rule.keywords.some((k) => t.includes(norm(k)));
+    const hit = isCode
+      ? !qualityReport && (keywordHit || FIRMWARE_ACTION.test(t) || (codeTargets.length > 0 && CHANGE_ACTION.test(t)))
+      : keywordHit || (rule.taskType === 'quality-8d' && qualityReport);
     if (!hit) continue;
+
+    if (isCode && !codeTargets.length) {
+      return {
+        taskType: 'clarify', stage: null, gateTarget: null, docTypes: [], severity: 'low',
+        riskLevel: 'low', title: titleOf(text), ruleId: rule.id, confidence: 'low',
+        reason: '需要明确要改动的固件应用层文件',
+        missing: ['要修改哪些应用层 .c 或 .h 文件？请提供相对路径，例如 firmware/app/main.c。'],
+      };
+    }
 
     const plan = planFor(rule.taskType, defaultStage);
     const severity = severityOverride.get(rule.taskType) ?? plan.defaultSeverity ?? 'medium';
@@ -130,7 +173,7 @@ export function assess({ text, policyRules = [], defaultStage = 'S1' }) {
           missing: ['要补哪份文档？可选项：' + Object.keys(DOC_TYPES).join(' / ')],
         };
       }
-      stage = DOC_TYPES[docTypes[0]].stage;
+      stage = stageForDocuments(docTypes);
     }
 
     return {
@@ -144,6 +187,7 @@ export function assess({ text, policyRules = [], defaultStage = 'S1' }) {
       reason: rule.reason,
       ruleId: rule.id,
       confidence: 'medium',
+      ...(isCode ? { codeTargets } : {}),
     };
   }
 
@@ -152,7 +196,7 @@ export function assess({ text, policyRules = [], defaultStage = 'S1' }) {
   if (hinted.length) {
     return {
       taskType: 'doc',
-      stage: DOC_TYPES[hinted[0]].stage,
+      stage: stageForDocuments(hinted),
       gateTarget: null,
       docTypes: hinted,
       severity: 'low',

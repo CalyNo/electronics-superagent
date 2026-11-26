@@ -11,8 +11,10 @@ import { runGateChecks } from '../domain/gate.mjs';
 import { validateDoc } from '../domain/templates.mjs';
 import { positionForDoc } from './positions.mjs';
 import { fillDocument, markAiAssisted } from './agent.mjs';
-import { modifySourceFile } from './codegen.mjs';
-import { ensureDir, todayISO, writeJson, sha256File, sha256Text, exists } from '../util/fsx.mjs';
+import {
+  applyAndBuildFirmware, modifySourceFile, prepareFirmwareBuild, readFirmwareSource, validateFirmwareCandidate,
+} from './codegen.mjs';
+import { ensureDir, todayISO, writeFileAtomic, writeJson, sha256File, sha256Text, exists } from '../util/fsx.mjs';
 import { DOC_TYPES } from '../domain/stages.mjs';
 
 export async function runAssignment({
@@ -37,67 +39,138 @@ export async function runAssignment({
     };
   }
 
-  // 固件代码变更（CODE）：无模板，按 plan.codeTargets 逐文件交给软件工程师(SW)岗位修改。
-  // codeTargets: [{ relPath, requirement?, notes? }]，需求缺省用工单标题。
-  const codeTargets = docTypes.includes('CODE') ? (plan.codeTargets ?? []) : [];
-  if (docTypes.includes('CODE') && !codeTargets.length) {
-    return {
-      status: 'blocked',
-      reason: 'code-change 任务缺少 plan.codeTargets（要改哪些固件文件），无法执行',
-      assets, notes,
-    };
+  const defaultBranch = project.manifest.integrations?.repo?.defaultBranch ?? 'develop';
+  const protectedList = policy?.execution?.protectedBranches ?? ['main', 'develop', 'release/*'];
+  const allowedPrefixes = rules.allowedBranchPrefixes ?? ['agent/', 'change/', 'fix/'];
+  const branchName = `${plan.branchPrefix ?? 'agent/'}${ticket.id}`;
+  let branch = branchName;
+  let base = null;
+  let baseSelected = false;
+  const selectGitBase = async () => {
+    const tip = engine.db.kvGet('repo:tip', null);
+    if (tip && await repo.branchExists(project.root, tip)) {
+      if (!await repo.checkoutBranch(project.root, tip)) throw new Error(`无法切换到上一工单分支 ${tip}`);
+      if (tip === branchName || tip.startsWith(`${branchName}-attempt-`)) {
+        branch = tip;
+        base = engine.db.kvGet(`repo:base:${branch}`, null);
+      } else {
+        base = tip;
+      }
+    } else {
+      base = await repo.checkoutBase(project.root, [defaultBranch, 'main', 'master']);
+    }
+    if (branch !== tip && await repo.branchExists(project.root, branch)) {
+      const attempt = `${branchName}-attempt-${assignment.attempt ?? 1}`;
+      branch = attempt;
+      for (let suffix = 2; await repo.branchExists(project.root, branch); suffix += 1) {
+        branch = `${attempt}-${suffix}`;
+      }
+    }
+    baseSelected = true;
+  };
+
+  let firmware = null;
+  const documentIndex = path.join(project.paths.index, 'documents.csv');
+  const traceIndex = path.join(project.paths.index, 'trace-edges.csv');
+  const indexFiles = [documentIndex];
+  const indexBefore = new Map();
+  const readIndex = (file) => fs.readFile(file).catch((err) => {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  });
+  const blocked = async (reason, commit = null) => {
+    if (firmware && !commit?.sha) {
+      const errors = await firmware.rollback();
+      if (errors.length) reason += `；部分固件文件需从备份恢复：${errors.join('；')}`;
+      for (const [file, original] of indexBefore) {
+        try {
+          const current = await readIndex(file);
+          if (current && (!original || !current.equals(original))) {
+            await writeFileAtomic(file, original ?? Buffer.alloc(0));
+          }
+        } catch (err) {
+          reason += `；索引恢复失败（${file}）：${err.message}`;
+        }
+      }
+    }
+    return { status: 'blocked', reason, assets: assets.filter((asset) => asset.kind !== 'code'), notes, commit };
+  };
+
+  const isFirmware = docTypes.includes('CODE');
+  const codeStage = DOC_TYPES.CODE.stage;
+  const codeTargets = isFirmware ? (plan.codeTargets ?? []) : [];
+  if (isFirmware) {
+    if (!codeTargets.length) return blocked('请提供要修改的固件应用层 .c 或 .h 文件的项目相对路径');
+    if (!project.manifest.stages?.enabled?.includes(codeStage)) return blocked(`项目未启用阶段 ${codeStage}，无法修改固件`);
   }
-  for (const target of codeTargets) {
+  if (options.git !== false) {
     try {
-      // 代码修改后端可注入：默认走内置 codegen（自建模型网关）；
-      // DSH 插件运行时注入 agentCodeModifier，由 software-engineer preset 在 DSH 会话内改固件。
-      // 两种后端都返回 { changed, sha256, backupPath?, model?, keyId?, tokens? }。
-      const req = {
-        projectRoot: project.root,
-        relPath: target.relPath,
-        requirement: target.requirement ?? ticket.title,
-        notes: target.notes ?? '',
-        pool: options.pool,
-        budget: options.budget ?? {},
-        engine, ticketId: ticket.id, positionCode: 'SW',
-      };
-      const res = typeof options.codeModifier === 'function'
-        ? await options.codeModifier(req)
-        : await modifySourceFile(req);
-      const id = 'CODE-' + sha256Text(target.relPath + ticket.id).slice(0, 8).toUpperCase();
-      assets.push({
-        kind: 'code', id, docType: 'CODE', stage: plan.stage ?? 'S2',
-        title: `${ticket.title} · ${target.relPath}`,
-        relPath: target.relPath, absPath: path.resolve(project.root, target.relPath),
-        revision: 'wip', sha256: res.sha256,
-        validation: { ok: true, errors: [], warnings: res.changed ? [] : ['文件未发生变化'] },
-        position: 'SW', aiAssisted: true,
-        backupPath: res.backupPath,
-      });
-      engine.registerAsset({
-        ticketId: ticket.id, kind: 'code', docType: 'CODE', stage: plan.stage ?? 'S2',
-        path: target.relPath, revision: 'wip', sha256: res.sha256, status: 'valid',
-        title: `${ticket.title} · ${target.relPath}`, position: 'SW', aiAssisted: true,
-      });
-      notes.push(`固件代码修改：${target.relPath}${res.changed ? '' : '（无变化）'}`);
-      if (engine && res.tokens) engine.recordUsage({
-        ticketId: ticket.id, position: 'SW', pool: res.keyId ?? 'worker',
-        keyId: res.keyId ?? null, model: res.model ?? null, tokens: res.tokens,
-        purpose: `code:${target.relPath}`,
-      });
+      const check = repo.assertBranchAllowed(branch, { protectedList, allowedPrefixes });
+      if (!check.ok) throw new Error(check.reason);
+      if (await repo.isRepo(project.root)) await selectGitBase();
     } catch (err) {
-      return {
-        status: 'blocked',
-        reason: `固件代码修改失败（${target.relPath}）：${err.message}`,
-        assets, notes,
-      };
+      return blocked(`仓库操作失败：${err.message}`);
+    }
+  }
+  if (codeTargets.length) {
+    try {
+      const projectRoot = await fs.realpath(project.root);
+      const build = await prepareFirmwareBuild(projectRoot,
+        options.firmwareBuild ?? project.manifest.integrations?.firmware?.build);
+      const targets = new Map();
+      for (const target of codeTargets) {
+        const source = await readFirmwareSource(projectRoot, target.relPath);
+        if (!targets.has(source.absPath)) targets.set(source.absPath, { source, target });
+      }
+      if (baseSelected && await repo.hasTrackedChanges(project.root, [...targets.keys()])) {
+        throw new Error('目标固件文件有未提交的工作区或暂存更改，请先处理后再重试');
+      }
+      const sources = [];
+      const modifier = options.codeModifier ?? modifySourceFile;
+      for (const { source, target } of targets.values()) {
+        try {
+          const res = await modifier({
+            projectRoot, relPath: source.relPath, original: source.original,
+            requirement: target.requirement ?? (plan.inputText?.trim() ? plan.inputText : ticket.title),
+            notes: target.notes ?? '', pool: options.pool, budget: options.budget ?? {},
+            engine, ticketId: ticket.id, positionCode: 'SW',
+          });
+          if (engine && res?.tokens) engine.recordUsage({
+            ticketId: ticket.id, position: 'SW', pool: res.keyId ?? 'worker',
+            keyId: res.keyId ?? null, model: res.model ?? null, tokens: res.tokens,
+            purpose: `code:${source.relPath}`,
+          });
+          source.text = validateFirmwareCandidate(source.original, res?.text);
+          sources.push(source);
+        } catch (err) {
+          throw new Error(`${source.relPath}：${err.message}`);
+        }
+      }
+
+      firmware = await applyAndBuildFirmware({
+        projectRoot, sources, build, backupRoot: path.join(stateDir, 'codegen', ticket.id),
+        redactPatterns: rules.redactPatterns,
+      });
+      notes.push(`固件编译验证通过（退出码 ${firmware.exitCode}）`);
+      for (const { relPath, absPath, text, original, backupPath } of sources) {
+        const changed = text !== original;
+        assets.push({
+          kind: 'code', id: 'CODE-' + sha256Text(relPath + ticket.id).slice(0, 8).toUpperCase(),
+          docType: 'CODE', stage: codeStage, title: `${ticket.title} · ${relPath}`,
+          relPath, absPath, revision: 'wip', sha256: sha256Text(text),
+          validation: { ok: true, errors: [], warnings: changed ? [] : ['文件未发生变化'] },
+          position: 'SW', aiAssisted: true, backupPath,
+        });
+        notes.push(`固件代码修改：${relPath}${changed ? '' : '（无变化）'}`);
+      }
+    } catch (err) {
+      return blocked(`固件代码修改失败：${err.message}`);
     }
   }
 
-  const generated = [];
   for (const docType of docTypes.filter((t) => t !== 'CODE')) {
     let doc = await generateDoc({
-      project, docType, rules, fallbackTemplateDir,
+      project, docType, taskType: ticket.task_type, rules, fallbackTemplateDir,
       nextDocIndex: (stage, type) => engine.nextDocIndex(stage, type),
       ctx: {
         title: ticket.title,
@@ -150,7 +223,6 @@ export async function runAssignment({
       }
     }
 
-    generated.push(doc);
     assets.push({
       kind: 'document',
       id: doc.id,
@@ -177,43 +249,45 @@ export async function runAssignment({
 
   const invalid = assets.filter((a) => !a.validation.ok);
   if (invalid.length) {
-    return {
-      status: 'blocked',
-      reason: `有 ${invalid.length} 份文档未通过结构校验，需要补齐后重试`,
-      assets, notes,
-    };
+    return blocked(`有 ${invalid.length} 份文档未通过结构校验，需要补齐后重试`);
   }
 
-  // 索引与追溯
-  for (const a of assets) {
-    await upsertDocumentIndex({
-      project,
-      row: {
-        id: a.id,
-        title: a.title ?? `${ticket.title} ${DOC_TYPES[a.docType]?.name ?? a.docType}`,
-        project: project.manifest.code,
-        stage: a.stage,
-        type: a.docType,
-        revision: a.revision,
-        status: 'draft',
-        classification: project.manifest.system?.defaultClassification ?? 'internal',
-        owner: DOC_TYPES[a.docType]?.owner ?? '',
-        path: a.relPath,
-        ticket: ticket.id,
-        updated: startedAt,
-      },
-    });
+  try {
+    const ids = assets.map((a) => a.id);
+    const edges = [];
+    for (let i = 1; i < ids.length; i++) edges.push({ upstream: ids[0], downstream: ids[i], relation: 'derives', note: ticket.id });
+    if (edges.length) indexFiles.push(traceIndex);
+    if (firmware) {
+      for (const file of indexFiles) indexBefore.set(file, await readIndex(file));
+    }
+    for (const a of assets) {
+      await upsertDocumentIndex({
+        project,
+        row: {
+          id: a.id,
+          title: a.title ?? `${ticket.title} ${DOC_TYPES[a.docType]?.name ?? a.docType}`,
+          project: project.manifest.code,
+          stage: a.stage,
+          type: a.docType,
+          revision: a.revision,
+          status: 'draft',
+          classification: project.manifest.system?.defaultClassification ?? 'internal',
+          owner: DOC_TYPES[a.docType]?.owner ?? '',
+          path: a.relPath,
+          ticket: ticket.id,
+          updated: startedAt,
+        },
+      });
+    }
+    if (edges.length) await appendTraceability({ project, edges });
+  } catch (err) {
+    if (firmware) return blocked(`索引与追溯写入失败：${err.message}`);
+    throw err;
   }
-  const ids = assets.map((a) => a.id);
-  const edges = [];
-  for (let i = 1; i < ids.length; i++) edges.push({ upstream: ids[0], downstream: ids[i], relation: 'derives', note: ticket.id });
-  if (edges.length) await appendTraceability({ project, edges });
 
   // Git
   let commit = null;
   let prDraftPath = null;
-  const defaultBranch = project.manifest.integrations?.repo?.defaultBranch ?? 'develop';
-  const protectedList = policy?.execution?.protectedBranches ?? ['main', 'develop', 'release/*'];
 
   if (options.git !== false) {
     try {
@@ -222,44 +296,38 @@ export async function runAssignment({
       // 堆叠分支：本工单分支基于上一张工单的分支，使工作区里的文档持续累积。
       // 取舍：牺牲"每张 PR 都相对 develop 独立"的纯粹性，换取门禁能读到全部已完成文档；
       // 生产环境应改为 worktree 从 develop 拉出 + 合并后校验（docs/00 §10 已记录该偏差）。
-      const tip = engine.db.kvGet('repo:tip', null);
-      let base = null;
-      if (tip && (await repo.branchExists(project.root, tip))) {
-        await repo.checkoutBranch(project.root, tip);
-        base = tip;
-      } else {
-        base = await repo.checkoutBase(project.root, [defaultBranch, 'main', 'master']);
-      }
+      if (!baseSelected) await selectGitBase();
 
-      const branch = `${plan.branchPrefix ?? 'agent/'}${ticket.id}`;
-      await repo.createBranch(project.root, branch, {
-        protectedList,
-        allowedPrefixes: rules.allowedBranchPrefixes ?? ['agent/', 'change/', 'fix/'],
-      });
-
-      const indexFiles = [path.join(project.paths.index, 'documents.csv'), path.join(project.paths.index, 'trace-edges.csv')];
       const files = [];
       for (const f of [...assets.map((a) => a.absPath), ...indexFiles]) {
         // trace-edges.csv 只在存在追溯边时才生成，直接 add 不存在的路径会让整次提交失败
         if (await exists(f)) files.push(f);
       }
 
-      const hits = await repo.scanSecrets(assets.map((a) => a.absPath), rules.redactPatterns ?? []);
+      const hits = await repo.scanSecrets(files, rules.redactPatterns ?? []);
       if (hits.length) {
         notes.push(`凭据扫描命中 ${hits.length} 处，已阻断提交：${hits[0].file}`);
-        return { status: 'blocked', reason: '产物中检出疑似凭据，已阻断提交', assets, notes };
+        return blocked('产物中检出疑似凭据，已阻断提交');
       }
 
       const maxDiff = rules.maxDiffLines ?? 800;
-      const diff = await repo.stagedDiffLines(project.root);
-      if (diff > maxDiff) notes.push(`改动 ${diff} 行，超过单工单上限 ${maxDiff} 行，需人工确认（docs/06 §4）`);
+      const diff = await repo.workingDiffLines(project.root, files);
+      if (diff > maxDiff) {
+        const reason = `改动 ${diff} 行，超过单工单上限 ${maxDiff} 行，需人工确认（docs/06 §4）`;
+        if (firmware) return blocked(reason);
+        notes.push(reason);
+      }
 
+      await repo.createBranch(project.root, branch, { protectedList, allowedPrefixes });
+      if (firmware) await firmware.verify();
       commit = await repo.commitFiles(
         project.root, files,
         `${plan.commitPrefix ?? 'chore'}(${ticket.id}): ${ticket.title}`,
         { author: options.author ?? policy?.execution?.commitAuthor }
       );
-      engine.db.kvSet('repo:tip', branch, engine.now());
+      const now = engine.now();
+      if (base) engine.db.kvSet(`repo:base:${branch}`, base, now);
+      engine.db.kvSet('repo:tip', branch, now);
 
       // 门禁快照要在文档落盘之后重新跑，否则 PR 里写的是提交前的旧状态
       let gate = null;
@@ -272,14 +340,24 @@ export async function runAssignment({
       prDraftPath = await repo.writePrDraft(stateDir, ticket.id, draft);
       notes.push(`PR 草案：${prDraftPath}（目标分支 ${base ?? '-'}）`);
     } catch (err) {
-      return { status: 'blocked', reason: `仓库操作失败：${err.message}`, assets, notes, commit };
+      return blocked(`仓库操作失败：${err.message}`, commit);
     }
   }
 
-  // 产物哈希复核（落盘后被改动要能被发现）
+  if (firmware) {
+    try { await firmware.verify(); }
+    catch (err) { return blocked(`已通过编译的固件文件校验失败：${err.message}`, commit); }
+  }
   for (const a of assets) {
-    const h = await sha256File(a.absPath);
-    a.sha256 = h;
+    if (a.kind !== 'code') {
+      a.sha256 = await sha256File(a.absPath);
+      continue;
+    }
+    engine.registerAsset({
+      ticketId: ticket.id, kind: a.kind, docType: a.docType, stage: a.stage,
+      path: a.relPath, revision: a.revision, sha256: a.sha256, status: 'valid',
+      title: a.title, position: a.position, aiAssisted: a.aiAssisted,
+    });
   }
 
   return { status: 'ready', assets, commit, prDraftPath, notes };

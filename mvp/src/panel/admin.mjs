@@ -50,6 +50,7 @@ export const ADMIN_HTML = `<!doctype html>
   button.primary:hover{opacity:.92;color:#fff}
   button.danger{color:var(--bad);border-color:currentColor}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+  #operatorControls[hidden]{display:none}
   .editor{background:var(--chip);border-radius:8px;padding:10px;margin:6px 0}
   .notice{border-left:3px solid var(--warn);padding:6px 10px;background:var(--chip);border-radius:4px;font-size:12.5px;color:var(--muted)}
   .empty{padding:8px 0;color:var(--muted);font-size:13px}
@@ -81,6 +82,10 @@ export const ADMIN_HTML = `<!doctype html>
 
   <section>
     <h2>执行与队列</h2>
+    <div id="operatorControls" class="row" hidden>
+      <label for="operatorToken">操作员令牌</label>
+      <input type="password" id="operatorToken" autocomplete="off" spellcheck="false">
+    </div>
     <div id="assignments"></div>
   </section>
 
@@ -122,11 +127,19 @@ function toast(msg, kind) {
 }
 
 async function api(path, opts) {
-  const res = await fetch(path, Object.assign({ headers: H }, opts || {}));
+  const res = await fetch(path, { ...opts, headers: { ...H, ...(opts?.headers || {}) } });
   let body = null;
   try { body = await res.json(); } catch (e) { body = { error: '响应不是 JSON' }; }
   if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
   return body;
+}
+
+async function operatorPost(path, body) {
+  const input = document.getElementById('operatorToken');
+  const token = input.value.trim();
+  if (!token) { input.focus(); throw new Error('请输入操作员令牌'); }
+  input.value = '';
+  return api(path, { method: 'POST', headers: { authorization: 'Bearer ' + token }, body: JSON.stringify(body) });
 }
 
 const stCls = (s) => (s === 'valid' || s === 'done' || s === 'released' || s === 'closed' || s === 'review') ? 'ok'
@@ -182,15 +195,21 @@ function renderWork() {
     + '<div class="line muted">今日 ' + fnum(p.today.tokens) + ' tokens / ' + p.today.calls + ' 次</div>'
     + '</div>').join('');
 
-  const rows = d.assignments.map(a =>
-    '<tr><td><code>' + esc(a.ticketId) + '</code></td>'
+  document.getElementById('operatorControls').hidden = !d.operatorActions;
+  const rows = d.assignments.map(a => {
+    const latest = d.assignments.find(x => x.ticketId === a.ticketId);
+    const retry = d.operatorActions && a.id === latest.id && a.ticketStatus === 'blocked' && !['queued', 'working'].includes(a.status);
+    const detail = a.waitingOn?.length ? '等待 ' + a.waitingOn.join('、') + ' 放行' : (a.note || '').slice(0, 70);
+    return '<tr><td><code>' + esc(a.ticketId) + '</code></td>'
     + '<td>' + esc(a.title || '').slice(0, 36) + '</td>'
     + '<td>' + esc(a.taskType) + '</td>'
     + '<td><span class="tag ' + stCls(a.status) + '">' + esc(a.status) + '</span></td>'
     + '<td class="muted">' + (a.startedAt ? ago(a.startedAt) : '-') + '</td>'
-    + '<td class="muted">' + esc((a.note || '').slice(0, 70)) + '</td></tr>').join('');
+    + '<td class="muted">' + esc(detail) + '</td><td>'
+    + (retry ? '<button data-retry="' + esc(a.ticketId) + '">重试工单</button>' : '') + '</td></tr>';
+  }).join('');
   document.getElementById('assignments').innerHTML = rows
-    ? '<table><thead><tr><th>工单</th><th>标题</th><th>类型</th><th>状态</th><th>开始</th><th>备注</th></tr></thead><tbody>' + rows + '</tbody></table>'
+    ? '<table><thead><tr><th>工单</th><th>标题</th><th>类型</th><th>状态</th><th>开始</th><th>备注</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table>'
     : '<div class="empty">没有派工记录。投一条消息试试。</div>';
 
   const drows = d.deliverables.map(x =>
@@ -208,10 +227,14 @@ function renderWork() {
 
   const gs = d.gates.map(g => {
     const gaps = (g.checks || []).filter(c => !c.ok && !c.skipped);
-    const actions = g.status === 'pending'
-      ? '<button class="primary" data-gate="' + esc(g.id) + '" data-act="sign">签署放行</button> '
-        + '<button class="danger" data-gate="' + esc(g.id) + '" data-act="return">退回</button>'
-      : '<span class="muted">' + (g.status === 'released' ? '已放行' : '需先补齐缺口') + '</span>';
+    let actions = '<span class="muted">' + (g.status === 'released' ? '已放行' : g.status === 'pending' ? '使用本机 CLI 签署' : '需先补齐缺口') + '</span>';
+    if (g.status === 'pending' && d.operatorActions) {
+      actions = '<button class="primary" data-gate="' + esc(g.id) + '" data-act="sign">签署放行</button> '
+        + '<button class="danger" data-gate="' + esc(g.id) + '" data-act="return">退回</button>';
+    }
+    if (g.status === 'returned' && !gaps.length) {
+      actions = d.operatorActions ? '<button data-gate="' + esc(g.id) + '" data-act="resubmit">重新提交门禁</button>' : '使用本机 CLI 重提';
+    }
     return '<tr><td><code>' + esc(g.id) + '</code></td><td>' + esc(g.name) + '</td>'
       + '<td><span class="tag ' + stCls(g.status) + '">' + esc(g.status) + '</span></td>'
       + '<td class="muted">' + (gaps.length ? esc(gaps.map(c => c.detail).join('；')).slice(0, 120) : '无缺口') + '</td>'
@@ -220,7 +243,6 @@ function renderWork() {
   }).join('');
   document.getElementById('gates').innerHTML = gs
     ? '<table><thead><tr><th>门</th><th>名称</th><th>状态</th><th>缺口</th><th>签署人</th><th>操作</th></tr></thead><tbody>' + gs + '</tbody></table>'
-      + '<div class="notice" style="margin-top:8px">门禁只能由人签署：机器最多推进到「待签署」，出现缺口时先补齐交付物。首次签署会要求输入签署人的飞书 open_id（仅存本机浏览器）。</div>'
     : '<div class="empty">尚未生成门禁。</div>';
 }
 
@@ -313,24 +335,24 @@ document.addEventListener('click', async (ev) => {
     return;
   }
 
-  // 阶段门：签署 / 退回（只有 pending 才渲染按钮，服务端仍会二次校验权限）
+  if (btn.dataset.retry) {
+    try {
+      await operatorPost('/api/tickets/' + btn.dataset.retry + '/retry', {});
+      toast('已重新排队', 'ok');
+      await loadWork();
+    } catch (e) { toast(e.message, 'bad'); }
+    return;
+  }
+
   if (btn.dataset.gate) {
     const gate = btn.dataset.gate;
     const gateAct = btn.dataset.act;
-    let openId = localStorage.getItem('sa_openId');
-    if (!openId) {
-      openId = prompt('请输入签署人的飞书 open_id（例如 ou_xxx）：');
-      if (!openId) return;
-      localStorage.setItem('sa_openId', openId.trim());
-    }
-    const note = prompt(gateAct === 'sign' ? '签署意见（可留空）：' : '退回原因：', '');
-    // 契约：sign 接口读 note，return 接口读 reason —— 字段不能混用
-    const body = gateAct === 'sign'
-      ? { openId: openId.trim(), note: note || null }
-      : { openId: openId.trim(), reason: note || '退回' };
+    const note = gateAct === 'resubmit' ? '' : prompt(gateAct === 'sign' ? '签署意见（可留空）：' : '退回原因：', '');
+    if (note === null) return;
+    const body = gateAct === 'sign' ? { note: note || null } : { reason: note || '退回' };
     try {
-      await api('/api/gates/' + gate + '/' + gateAct, { method: 'POST', body: JSON.stringify(body) });
-      toast(gate + (gateAct === 'sign' ? ' 已签署放行' : ' 已退回'), 'ok');
+      await operatorPost('/api/gates/' + gate + '/' + gateAct, body);
+      toast(gate + ({ sign: ' 已签署放行', return: ' 已退回', resubmit: ' 已重新提交' })[gateAct], 'ok');
       await loadWork();
     } catch (e) { toast(e.message, 'bad'); }
     return;

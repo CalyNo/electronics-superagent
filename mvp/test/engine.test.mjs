@@ -188,6 +188,8 @@ test('人可撤回，执行器不可自我停止', async () => {
   const e = engine.evaluate(engine.pendingThreads()[0].threadId);
   const { ticketId } = engine.accept(e.id);
   assert.equal(engine.stopTicket(ticketId, { actor: 'u_pm', reason: '需求取消' }).status, 'dropped');
+  assert.equal(engine.getTicket(ticketId).assignment.status, 'cancelled');
+  assert.equal(engine.listAssignments({ status: 'queued' }).length, 0);
   assert.throws(() => engine.stopTicket(ticketId, { actor: 'u_pm' }), /已 dropped/);
   // 执行器回报失败只会走 finishAssignment，不提供把工单置 dropped 的路径
   assert.equal(typeof engine.selfDrop, 'undefined');

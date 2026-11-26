@@ -3,60 +3,31 @@
 #
 # 两个插入项：
 #   1. electronics-superagent       —— 宿主插件，持有引擎/面板，注入 DSH agent 作为固件修改后端
-#   2. software-engineer preset     —— 带固件写权限的 agent 模式，真正执行代码修改
+#   2. software-engineer preset     —— 接收原文和需求，返回候选源码
 - insert:
     - id: electronics-superagent
       name: '@local/electronics-superagent'
       config:
-        projectDir: 'D:/yoxi/superagent/projects/蓝牙接收控制器'
-        source: feishu
+        projectDir: !!js process.env.SUPERAGENT_PROJECT_DIR || ''
+        skillsDir: !!js process.env.SUPERAGENT_SKILLS_DIR || ''
+        source: !!js process.env.SUPERAGENT_SOURCE || 'local'
         panel: true
         host: 127.0.0.1
         port: 8787
         intervalMs: 1500
         codePresetId: software-engineer
-        policyFile: 'D:/yoxi/superagent/projects/蓝牙接收控制器/.superagent/policy.yml'
-        # 模型密钥走环境变量，不写明文；留空时引擎退化为只出文档骨架
 
     - id: preset-software-engineer
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: software-engineer
         name: 软件工程师
-        description: 电子超体固件岗位，可在 firmware/ble/app 白名单内修改与编译 T23 固件
+        description: 根据需求和原文生成固件应用层候选源文件
         order: 88
         plugins:
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: >-
-                你是汽车电子软件工程师（电子超体的 SW 岗位）。你只修改 firmware/ble/app 应用代码，
-                不碰 SDK/CMSIS/middleware/bootloader 与构建产物。改动最小、遵循现有风格，
-                给出完整可编译文件而非片段。无法安全实现时保持文件不变并说明原因。
-          - id: agent-instructions
-            name: '@deepseek-ai/dsh-agent-instructions'
-          - id: time-context
-            name: '@deepseek-ai/dsh-time-context'
-          - id: tool-fs
-            name: '@deepseek-ai/dsh-tool-fs'
-          - id: tool-fs-search
-            name: '@deepseek-ai/dsh-tool-fs-search'
-          - id: tool-bash
-            name: '@deepseek-ai/dsh-tool-bash'
-            disabled: !!js process.platform === 'win32'
-          - id: tool-pwsh
-            name: '@deepseek-ai/dsh-tool-pwsh'
-            disabled: !!js process.platform !== 'win32'
-          - id: bash-sandbox
-            name: '@deepseek-ai/dsh-bash-sandbox'
-          - id: tool-jobs
-            name: '@deepseek-ai/dsh-tool-jobs'
-          - id: tool-schedule
-            name: '@deepseek-ai/dsh-tool-schedule'
-          - id: tool-skill
-            name: '@deepseek-ai/dsh-tool-skill'
-          - id: skill-filesystem
-            name: '@deepseek-ai/dsh-skill-filesystem'
-            config:
-              customSkillDirs:
-                - 'D:/yoxi/superagent/electronics-superagent/dsh-bundle/skills'
+                你是电子超体的嵌入式软件工程师。根据给出的原始源码和工单全文生成完整候选文件。
+                采用最小改动并保留项目风格。缺少关键上下文时，以 BLOCKED: 开头说明缺少的信息。

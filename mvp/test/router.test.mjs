@@ -54,10 +54,47 @@ test('路由：仅提到文档类型也能落成补齐任务', () => {
 });
 
 test('路由：固件代码修改 → code-change，由软件工程师执行', () => {
-  const a = assess({ text: '修改 T23 固件代码实现双击进入配对' });
+  const text = '修改 `T23/projects/n32wb03x_EVAL/ble/app/src/key.c` 和 firmware\\app\\inc\\config.h。\n双击进入配对，超时后恢复原行为。';
+  const a = assess({ text });
   assert.equal(a.taskType, 'code-change');
   assert.deepEqual(a.docTypes, ['CODE']);
   assert.equal(a.gateTarget, null);
+  assert.deepEqual(a.codeTargets, [
+    { relPath: 'T23/projects/n32wb03x_EVAL/ble/app/src/key.c', requirement: text },
+    { relPath: 'firmware/app/inc/config.h', requirement: text },
+  ]);
+});
+
+test('路由：固件修改缺少明确的应用层文件时询问相对路径', () => {
+  for (const text of [
+    '修改 T23 固件代码实现双击进入配对',
+    '改固件 key.c、../firmware/app/key.c、D:/tool/firmware/app/key.c',
+    '改固件 T23/projects/n32wb03x_EVAL/ble/boot/src/main.c',
+  ]) {
+    const a = assess({ text });
+    assert.equal(a.taskType, 'clarify');
+    assert.match(clarifyQuestion(a), /相对路径/);
+  }
+});
+
+test('路由：提及应用文件的投诉仍进入 8D', () => {
+  const a = assess({ text: '客户投诉 T23/projects/PCU/ble/app/main.c 启动异常，请出 8D' });
+  assert.equal(a.taskType, 'quality-8d');
+});
+
+test('路由：明确点名文件和修改动作时进入固件工单', () => {
+  const a = assess({ text: '将 firmware/app/main.c 的阈值改为 5，解决启动故障' });
+  assert.equal(a.taskType, 'code-change');
+  assert.equal(a.codeTargets[0].relPath, 'firmware/app/main.c');
+});
+
+test('路由：跨阶段文档以最高阶段作为工单阶段', () => {
+  for (const text of ['补一份 DFMEA 和 PFMEA', 'DFMEA、PFMEA']) {
+    const a = assess({ text });
+    assert.equal(a.taskType, 'doc');
+    assert.equal(a.stage, 'S3');
+    assert.deepEqual(a.docTypes, ['DFMEA', 'PFMEA']);
+  }
 });
 
 test('路由：软件工程师代号为 SW', () => {

@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { makeRuntime, say, cleanup, gitOutput } from './helpers.mjs';
+import { Runtime } from '../src/app/runtime.mjs';
+import { makeProject, makeRuntime, say, cleanup, gitOutput } from './helpers.mjs';
 
 // 端到端：从"投一条消息"到"仓库里出现受控产物"，覆盖验收标准 A1–A12
 
@@ -135,4 +136,155 @@ test('e2e：含糊需求只问一句，不开工单', async (t) => {
   const question = lines.at(-1)?.text ?? '';
   assert.match(question, /需要确认一点/);
   assert.equal(question.split('？').length - 1, 1, '一次只问一个问题');
+});
+
+test('e2e：下阶段等待放行，队列仍可执行前阶段和量产质量工单', async (t) => {
+  const { dir, runtime } = await makeRuntime({ stages: ['S1', 'S2', 'S5'], git: false, aiFill: false });
+  t.after(() => cleanup(runtime, dir));
+
+  await say(dir, { actor: 'ou_xxx3', text: '替换 BOM 中的 MOS 管型号，发起设计变更' });
+  assert.equal((await runtime.tick()).executed, 0);
+  const [design] = runtime.engine.listTickets();
+  assert.equal(runtime.engine.getTicket(design.id).assignment.status, 'queued');
+  assert.deepEqual(runtime.engine.listAssignments({ status: 'queued' })[0].waitingOn, ['G1']);
+
+  await say(dir, { actor: 'ou_xxx3', text: '启动新项目立项' });
+  await say(dir, { actor: 'ou_xxx2', text: '客户投诉批量不良，请开 8D' });
+  assert.equal((await runtime.tick()).executed, 2);
+  await runtime.signGate('G1', { actorId: 'ou_xxx3' });
+  assert.equal((await runtime.tick()).executed, 1);
+  assert.equal(runtime.engine.getTicket(design.id).status, 'review');
+  assert.equal(runtime.engine.getGate('G2').status, 'pending');
+});
+
+test('e2e：跨阶段文档工单等待最晚交付阶段的前置门禁', async (t) => {
+  const { dir, runtime } = await makeRuntime({ stages: ['S2', 'S3'], git: false, aiFill: false });
+  t.after(() => cleanup(runtime, dir));
+  await say(dir, { actor: 'ou_xxx4', text: '补 DFMEA 和控制计划' });
+  assert.equal((await runtime.tick()).executed, 0);
+  const [doc] = runtime.engine.listTickets();
+  assert.deepEqual(runtime.engine.listAssignments({ status: 'queued' })[0].waitingOn, ['G2']);
+
+  await say(dir, { actor: 'ou_xxx3', text: '替换 BOM 中的 MOS 管型号，发起设计变更' });
+  assert.equal((await runtime.tick()).executed, 1);
+  await runtime.signGate('G2', { actorId: 'ou_xxx3' });
+  assert.equal((await runtime.tick()).executed, 1);
+  assert.deepEqual(runtime.engine.assetsOf(doc.id).map((a) => a.doc_type).sort(), ['CP', 'DFMEA']);
+});
+
+test('e2e：签署入口立即重检当前交付物', async (t) => {
+  const { dir, runtime } = await makeRuntime({ stages: ['S1'], git: false, aiFill: false });
+  t.after(() => cleanup(runtime, dir));
+
+  await say(dir, { actor: 'ou_xxx3', text: '启动新项目立项' });
+  await runtime.tick();
+  const [ticket] = runtime.engine.listTickets();
+  const [asset] = runtime.engine.assetsOf(ticket.id);
+  await fs.writeFile(path.join(dir, asset.path), '交付物损坏', 'utf8');
+
+  await assert.rejects(async () => runtime.signGate('G1', { actorId: 'ou_xxx3' }));
+  assert.equal(runtime.engine.getGate('G1').status, 'preparing');
+  assert.equal(runtime.engine.getTicket(ticket.id).status, 'review');
+});
+
+test('e2e：授权退回后保持阻塞，新一轮派工完成才能重新待签', async (t) => {
+  const { dir, runtime } = await makeRuntime({ stages: ['S1', 'S5'], aiFill: false });
+  t.after(() => cleanup(runtime, dir));
+
+  await say(dir, { actor: 'ou_xxx3', text: '启动新项目立项' });
+  await runtime.tick();
+  const [ticket] = runtime.engine.listTickets();
+  assert.throws(() => runtime.engine.returnGate('G1', { actorId: 'ou_xxx4', reason: '复核' }), { code: 'gate/forbidden' });
+  runtime.engine.returnGate('G1', { actorId: 'ou_xxx3', reason: '补充风险登记' });
+  await say(dir, { actor: 'ou_xxx2', text: '客户投诉批量不良，请开 8D' });
+  await runtime.tick();
+  assert.equal(runtime.engine.getGate('G1').status, 'returned');
+  const quality = runtime.engine.listTickets().find((t) => t.task_type === 'quality-8d');
+  assert.equal(quality.status, 'review');
+  const qualityHead = await gitOutput(dir, ['rev-parse', 'HEAD']);
+  assert.throws(() => runtime.engine.retryTicket(ticket.id, { actorId: 'ou_xxx4' }), { code: 'ticket/forbidden' });
+
+  const retry = runtime.engine.retryTicket(ticket.id, { actorId: 'ou_xxx3' });
+  assert.equal(retry.attempt, 2);
+  assert.throws(() => runtime.engine.retryTicket(ticket.id, { actorId: 'ou_xxx3' }), { code: 'ticket/retry-pending' });
+  await runtime.tick();
+  const history = runtime.engine.history(ticket.id);
+  assert.deepEqual(history.assignments.map((a) => a.status), ['done', 'done']);
+  assert.equal(history.ticket.status, 'review');
+  assert.equal(runtime.engine.getGate('G1').status, 'pending');
+  assert.equal(await gitOutput(dir, ['rev-parse', 'HEAD^']), qualityHead);
+});
+
+test('e2e：没有待审工单的门禁退回后可以显式重提', async (t) => {
+  const { dir, runtime } = await makeRuntime({ stages: ['S1'], git: false, aiFill: false });
+  t.after(() => cleanup(runtime, dir));
+  await say(dir, { actor: 'ou_xxx3', text: '启动新项目立项' });
+  await runtime.tick();
+  const [ticket] = runtime.engine.listTickets();
+  runtime.engine.stopTicket(ticket.id, { actor: 'ou_xxx3' });
+  runtime.engine.returnGate('G1', { actorId: 'ou_xxx3', reason: '人工复核' });
+  await runtime.tick();
+  assert.equal(runtime.engine.getGate('G1').status, 'returned');
+
+  assert.equal(typeof runtime.resubmitGate, 'function');
+  await assert.rejects(runtime.resubmitGate('G1', { actorId: 'ou_xxx4' }), { code: 'gate/forbidden' });
+  assert.equal((await runtime.resubmitGate('G1', { actorId: 'ou_xxx3' })).status, 'pending');
+});
+
+test('e2e：飞书确认收件后重启仍可处理，确认与放行都回复原消息', async (t) => {
+  const dir = await makeProject({ stages: ['S1'], git: false });
+  const replies = [];
+  t.mock.method(globalThis, 'fetch', async (url, request) => {
+    const endpoint = new URL(url).pathname;
+    if (endpoint.endsWith('/tenant_access_token/internal')) {
+      return Response.json({ code: 0, tenant_access_token: 'mock-access', expire: 7200 });
+    }
+    replies.push({ endpoint, body: JSON.parse(request.body) });
+    return Response.json({ code: 0 });
+  });
+  const options = {
+    source: 'feishu', git: false, aiFill: false, model: { configured: false },
+    env: { FEISHU_APP_ID: 'cli_test', FEISHU_APP_SECRET: 'test-app', FEISHU_VERIFICATION_TOKEN: 'test-callback' },
+  };
+  const event = {
+    header: { token: 'test-callback', event_id: 'evt-1', event_type: 'im.message.receive_v1' },
+    event: {
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_xxx3' } },
+      message: { message_type: 'text', chat_type: 'p2p', chat_id: 'oc_aaa', message_id: 'om_original', content: JSON.stringify({ text: '启动新项目立项' }) },
+    },
+  };
+  let runtime = await Runtime.create({ dir, options });
+  t.after(() => cleanup(runtime, dir));
+  assert.deepEqual(await runtime.source.handleEvent(event), { ok: true });
+  await runtime.close();
+
+  runtime = await Runtime.create({ dir, options });
+  assert.deepEqual(await runtime.source.handleEvent(event), { ok: true, duplicate: true });
+  assert.equal((await runtime.tick()).accepted, 1);
+  const later = structuredClone(event);
+  later.header.event_id = 'evt-2';
+  later.event.message.root_id = 'om_original';
+  later.event.message.message_id = 'om_later';
+  later.event.message.create_time = String(Date.now() + 1000);
+  await runtime.source.handleEvent(later);
+  await runtime.signGate('G1', { actorId: 'ou_xxx3' });
+  await runtime.flushOutbox();
+  assert.equal(replies.length, 3);
+  assert.ok(replies.every(({ endpoint }) => endpoint.endsWith('/im/v1/messages/om_original/reply')));
+  assert.equal(new Set(replies.map(({ body }) => body.uuid)).size, 3);
+  assert.equal(runtime.engine.stats().outboxPending, 0);
+});
+
+test('e2e：接单写入失败后收件仍可在下一轮重新处理', async (t) => {
+  const { dir, runtime } = await makeRuntime({ stages: ['S1'], git: false, aiFill: false });
+  t.after(() => cleanup(runtime, dir));
+  t.mock.method(runtime.engine, 'accept', () => { throw new Error('测试接单写入失败'); }, { times: 1 });
+  await say(dir, { actor: 'ou_xxx3', text: '启动新项目立项' });
+
+  const failed = await runtime.tick();
+  assert.match(failed.errors[0], /测试接单写入失败/);
+  assert.equal(runtime.engine.pendingThreads().length, 1);
+
+  assert.equal((await runtime.tick()).accepted, 1);
+  assert.equal(runtime.engine.stats().tickets, 1);
 });

@@ -1,7 +1,7 @@
 # 电子行业 SuperAgent 设计方案与 MVP
 
 > 参照 DeepSeek Harness 团队的 `dsh-superagent` 设计思路，面向汽车电子零部件研发场景构建的单信息源主动式工程智能体方案。
-> 方案已有一份**可运行的最小实现**：[`mvp/`](mvp/README.md)（零依赖 Node，`node --test` 62 项全绿）。
+> 可从 [`mvp/`](mvp/README.md) 运行零依赖的本地闭环、接入飞书或配置固件编译验证。
 
 ## 1. 这是什么
 
@@ -90,7 +90,7 @@
 cd mvp
 node src/cli.mjs demo            # 自动建 .demo/PCU24 并跑完三条场景
 node src/cli.mjs verify --dir .demo/PCU24
-node --test test/*.test.mjs      # 62 项测试
+node --test test/*.test.mjs
 ```
 
 自己走一遍：
@@ -125,11 +125,11 @@ scripts/import-project.sh /data/legacy/PCU_V2 --apply --code PCU24 --stages S1,S
 
 ```bash
 export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx FEISHU_VERIFICATION_TOKEN=xxx
+export FEISHU_BOT_OPEN_ID=ou_bot_xxx # 群内 @ 识别所需
 node src/cli.mjs run --dir ./pcu24 --source feishu --port 8787
-# 事件回调地址：http://<内网地址>:8787/feishu/event
 ```
 
-未配置凭据时不会崩：命令以退出码 3 退出并说明缺哪个变量。
+将飞书 HTTPS 事件回调转发到本机 `POST /feishu/event`，反向代理只开放该路径。缺应用凭据或回调校验令牌时，`run` 以退出码 3 结束。群聊识别对本机器人的 @，单聊可直接发起请求。
 
 ### 7.4 配模型密钥
 

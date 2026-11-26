@@ -3,7 +3,7 @@
 
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { DOC_TYPES, docDir, STAGES } from '../domain/stages.mjs';
+import { DOC_TYPES, docDir, STAGES, TASK_PLANS } from '../domain/stages.mjs';
 import { docId } from '../util/ids.mjs';
 import { buildDoc, validateDoc } from '../domain/templates.mjs';
 import { ensureDir, exists, sha256Text, toPosix, rel } from '../util/fsx.mjs';
@@ -26,14 +26,17 @@ export async function resolveTemplate(project, docType, fallbackDir = null) {
  * @returns {{id,docType,stage,relPath,absPath,text,validation,revision}}
  */
 export async function generateDoc({
-  project, docType, ctx, rules = {}, nextDocIndex, fallbackTemplateDir = null,
+  project, docType, taskType, ctx, rules = {}, nextDocIndex, fallbackTemplateDir = null,
 }) {
   const meta = DOC_TYPES[docType];
   if (!meta) throw new Error(`未知文档类型：${docType}`);
 
   const stage = meta.stage;
-  if (!(project.manifest.stages?.enabled ?? []).includes(stage)) {
-    throw new Error(`阶段 ${stage} 未在 manifest.stages.enabled 中启用，不能在该阶段产出文档`);
+  // ECN 统一归档在量产目录，设计与过程变更在本阶段就需要保留变更记录。
+  const activeStage = docType === 'ECN' && ['design-change', 'process-change'].includes(taskType)
+    ? TASK_PLANS[taskType].stage : stage;
+  if (!(project.manifest.stages?.enabled ?? []).includes(activeStage)) {
+    throw new Error(`阶段 ${activeStage} 未在 manifest.stages.enabled 中启用，不能在该阶段产出文档`);
   }
 
   const templateFile = await resolveTemplate(project, docType, fallbackTemplateDir);

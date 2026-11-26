@@ -1,16 +1,40 @@
 // 面板与管理 API：只回答三个问题（docs/01 §10）。
-// 安全：只绑 127.0.0.1；写操作要求自定义请求头（挡掉浏览器跨站表单）；
-// 飞书回调用 verification token 校验，不走自定义头。
+// 工作台只从本机监听器提供，工单和门禁变更需要绑定到人员的凭据。
 
 import http from 'node:http';
 import { URL } from 'node:url';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { ADMIN_HTML } from './admin.mjs';
 import { listPositions, positionForTask } from '../executor/positions.mjs';
 
 const SECURITY_HEADER = 'x-superagent-request';
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', '[::1]', 'localhost']);
+const operatorDigest = (token) => createHash('sha256').update(token).digest();
+
+function readOperators(env) {
+  if (!env?.SUPERAGENT_OPERATOR_TOKENS) return [];
+  let value;
+  try { value = JSON.parse(env.SUPERAGENT_OPERATOR_TOKENS); } catch { /* 只报告配置名称，避免意外打印令牌 */ }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('SUPERAGENT_OPERATOR_TOKENS 须为 JSON 对象');
+  const seen = new Set();
+  return Object.entries(value).map(([actorId, token]) => {
+    if (!actorId.trim() || typeof token !== 'string' || !/^[A-Za-z0-9_-]{32,}$/.test(token) || seen.has(token)) {
+      throw new Error('SUPERAGENT_OPERATOR_TOKENS 中每人须使用独立且至少 32 字符的令牌（字母、数字、下划线或连字符）');
+    }
+    seen.add(token);
+    return { actorId, digest: operatorDigest(token) };
+  });
+}
+
+function operatorOf(req, operators) {
+  const parsed = /^Bearer ([A-Za-z0-9_-]{32,})$/i.exec(req.headers.authorization ?? '');
+  if (!parsed) return null;
+  const digest = operatorDigest(parsed[1]);
+  return operators.find((o) => timingSafeEqual(o.digest, digest))?.actorId ?? null;
+}
 
 /** 工作台视图：把"谁在干什么、产出了什么、卡在哪"拼成一次响应 */
-function workbenchView(runtime) {
+function workbenchView(runtime, operatorActions) {
   const status = runtime.status();
   const today = new Date().toISOString().slice(0, 10);
   const assignments = runtime.engine.listAssignments({ limit: 40 });
@@ -51,6 +75,7 @@ function workbenchView(runtime) {
     queue,
     positions,
     assignments,
+    operatorActions,
     deliverables,
     gates,
     usage: {
@@ -88,11 +113,11 @@ function readBody(req, limit = 1_000_000) {
 }
 
 export function createPanelServer({ runtime, host = '127.0.0.1', port = 8787 }) {
+  const localPanel = LOOPBACK_HOSTS.has(host);
+  const operators = localPanel ? readOperators(runtime.env) : [];
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
-    const path = url.pathname;
-
     try {
+      const path = new URL(req.url, 'http://localhost').pathname;
       // 飞书事件回调
       if (req.method === 'POST' && path === '/feishu/event') {
         const remote = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
@@ -114,6 +139,10 @@ export function createPanelServer({ runtime, host = '127.0.0.1', port = 8787 }) 
         }
       }
 
+      if (!localPanel) return send(res, 404, { error: '此监听地址仅提供飞书回调' });
+      const panelUrl = new URL(`http://${req.headers.host ?? 'localhost'}`);
+      if (!LOOPBACK_HOSTS.has(panelUrl.hostname)) return send(res, 403, { error: '工作台仅接受本机地址' });
+
       if (req.method === 'GET' && (path === '/' || path === '/index.html')) {
         return send(res, 200, HTML, 'text/html; charset=utf-8');
       }
@@ -126,8 +155,11 @@ export function createPanelServer({ runtime, host = '127.0.0.1', port = 8787 }) 
         if (isWrite && req.headers[SECURITY_HEADER] !== '1') {
           return send(res, 403, { error: `写操作需要请求头 ${SECURITY_HEADER}: 1` });
         }
+        if (isWrite && req.headers.origin && req.headers.origin !== panelUrl.origin) {
+          return send(res, 403, { error: '工作台写操作需要同源请求' });
+        }
         if (req.method === 'GET' && path === '/api/state') return send(res, 200, runtime.panelData());
-        if (req.method === 'GET' && path === '/api/workbench') return send(res, 200, workbenchView(runtime));
+        if (req.method === 'GET' && path === '/api/workbench') return send(res, 200, workbenchView(runtime, operators.length > 0));
 
         // ---- 密钥管理：明文密钥永不出站；写操作走自定义头 + 127.0.0.1 ----
         if (path === '/api/keys' && req.method === 'GET') {
@@ -198,36 +230,34 @@ export function createPanelServer({ runtime, host = '127.0.0.1', port = 8787 }) 
           const h = runtime.engine.history(tMatch[1]);
           return h ? send(res, 200, h) : send(res, 404, { error: '工单不存在' });
         }
-        const stopMatch = /^\/api\/tickets\/([A-Z0-9-]+)\/stop$/.exec(path);
-        if (req.method === 'POST' && stopMatch) {
-          const body = await readBody(req) ?? {};
-          try {
-            runtime.engine.stopTicket(stopMatch[1], { actor: body.by ?? 'panel', reason: body.reason ?? '面板撤回' });
-            return send(res, 200, { ok: true });
-          } catch (err) { return send(res, 409, { error: err.message }); }
-        }
         if (req.method === 'GET' && path === '/api/gates') {
           return send(res, 200, runtime.engine.listGates());
         }
-        const signMatch = /^\/api\/gates\/(G[1-5])\/sign$/.exec(path);
-        if (req.method === 'POST' && signMatch) {
+        const ticketAction = /^\/api\/tickets\/([A-Z0-9-]+)\/(stop|retry)$/.exec(path);
+        const gateAction = /^\/api\/gates\/(G[1-5])\/(sign|return|resubmit)$/.exec(path);
+        if (req.method === 'POST' && (ticketAction || gateAction)) {
+          const actorId = operatorOf(req, operators);
+          if (!actorId) return send(res, 401, { error: '需要有效的操作员令牌' });
           const body = await readBody(req) ?? {};
-          if (!body.openId) return send(res, 400, { error: '缺少 openId' });
           try {
-            const g = runtime.engine.signGate(signMatch[1], { actorId: body.openId, note: body.note ?? null });
-            return send(res, 200, g);
+            if (ticketAction) {
+              const [, ticketId, action] = ticketAction;
+              const result = action === 'retry'
+                ? runtime.engine.retryTicket(ticketId, { actorId })
+                : runtime.engine.stopTicket(ticketId, { actor: actorId, reason: body.reason ?? '面板撤回' });
+              return send(res, 200, { ok: true, ...result });
+            }
+            const [, gateId, action] = gateAction;
+            const gate = action === 'sign'
+              ? await runtime.signGate(gateId, { actorId, note: body.note ?? null })
+              : action === 'resubmit'
+                ? await runtime.resubmitGate(gateId, { actorId })
+                : runtime.engine.returnGate(gateId, { actorId, reason: body.reason ?? '退回' });
+            return send(res, 200, gate);
           } catch (err) {
-            return send(res, err.code === 'gate/forbidden' ? 403 : 409, { error: err.message });
+            const code = err.code?.endsWith('/forbidden') ? 403 : err.code?.endsWith('/not-found') ? 404 : 409;
+            return send(res, code, { error: err.message });
           }
-        }
-        const returnMatch = /^\/api\/gates\/(G[1-5])\/return$/.exec(path);
-        if (req.method === 'POST' && returnMatch) {
-          const body = await readBody(req) ?? {};
-          if (!body.openId) return send(res, 400, { error: '缺少 openId' });
-          try {
-            const g = runtime.engine.returnGate(returnMatch[1], { actorId: body.openId, reason: body.reason ?? '退回' });
-            return send(res, 200, g);
-          } catch (err) { return send(res, 409, { error: err.message }); }
         }
         return send(res, 404, { error: '未知接口' });
       }
@@ -240,10 +270,15 @@ export function createPanelServer({ runtime, host = '127.0.0.1', port = 8787 }) 
 
   return {
     server,
-    listen: () => new Promise((resolve) => server.listen(port, host, () => {
-      const actual = server.address().port;   // port=0 时由系统分配，测试靠这个避免端口冲突
-      resolve({ url: `http://${host}:${actual}`, port: actual });
-    })),
+    listen: () => new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, host, () => {
+        server.off('error', reject);
+        const actual = server.address().port;
+        const address = host.includes(':') ? `[${host}]` : host;
+        resolve({ url: `http://${address}:${actual}`, port: actual });
+      });
+    }),
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }

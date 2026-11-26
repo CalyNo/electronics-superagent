@@ -225,24 +225,33 @@ export async function runGateChecks({ gateId, project, rules = {} }) {
   };
 }
 
+export async function refreshGate({ gateId, project, engine, rules }) {
+  const gate = GATES[gateId];
+  if (!gate?.deliverables.length || !project.manifest.stages?.enabled.includes(gate.stage)) {
+    throw new Error(`项目未启用可签署的门禁 ${gateId}`);
+  }
+  const res = await runGateChecks({ gateId, project, rules });
+  const waiting = engine.waitingGates(gate.stage);
+  const unfinished = engine.unfinishedGateTickets(gateId);
+  if (waiting.length) res.checks.push({ id: 'prerequisite_gates', ok: false, detail: `等待 ${waiting.join('、')} 放行` });
+  if (unfinished.length) res.checks.push({ id: 'gate_work_pending', ok: false, detail: `待完成工单：${unfinished.map((t) => t.id).join('、')}` });
+  if (waiting.length || unfinished.length) res.status = 'preparing';
+
+  const cur = engine.ensureGate(gateId, { name: gate.name, stage: gate.stage });
+  // 已签署的证据随放行留存，退回的工单需修订后再提交。
+  const updated = cur.status === 'released' ? cur : cur.status === 'returned'
+    ? engine.updateGateChecks(gateId, res.checks)
+    : engine.refreshGate(gateId, { status: res.status, checks: res.checks });
+  return { ...res, status: updated.status, checks: updated.checks };
+}
+
 /** 对已启用阶段的所有门禁跑一遍，并写回状态（机器最多推进到 pending） */
 export async function refreshGates({ project, engine, rules }) {
-  const enabled = new Set(project.manifest.stages?.enabled ?? []);
+  const enabled = project.manifest.stages?.enabled ?? [];
   const results = [];
   for (const gate of Object.values(GATES)) {
-    if (!enabled.has(gate.stage)) continue;
-    if (!gate.deliverables.length) continue;
-    const res = await runGateChecks({ gateId: gate.id, project, rules });
-    engine.ensureGate(gate.id, { name: gate.name, stage: gate.stage });
-    const cur = engine.getGate(gate.id);
-    if (cur.status === 'released' || cur.status === 'pending') {
-      // 已签署或已待签：只刷新证据，不回退状态（回退等于把人的决定覆盖掉）
-      const updated = engine.updateGateChecks(gate.id, res.checks);
-      results.push({ ...res, status: updated.status, checks: updated.checks });
-      continue;
-    }
-    const updated = engine.refreshGate(gate.id, { status: res.status, checks: res.checks });
-    results.push({ ...res, status: updated.status, checks: updated.checks });
+    if (!enabled.includes(gate.stage) || !gate.deliverables.length) continue;
+    results.push(await refreshGate({ gateId: gate.id, project, engine, rules }));
   }
   return results;
 }

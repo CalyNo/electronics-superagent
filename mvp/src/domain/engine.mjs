@@ -8,6 +8,7 @@
 import { stableKey, docId, ticketId as makeTicketId, assignmentId as makeAssignmentId } from '../util/ids.mjs';
 import { assess } from './router.mjs';
 import { buildMandate } from './policy.mjs';
+import { GATES } from './stages.mjs';
 
 export class UserError extends Error {
   constructor(code, message, details = null) {
@@ -251,6 +252,7 @@ export class Engine {
       this.enqueueOutbox({
         kind: 'reply',
         dedupeKey: `ack:${tid}`,
+        triggerIds: ev.triggerIds,
         payload: {
           threadId: ev.thread_id,
           text: `已接单 ${tid}：${a.title}\n类型 ${a.taskType}｜阶段 ${a.stage ?? '-'}｜门禁 ${a.gateTarget ?? '不适用'}\n交付物：${(a.docTypes ?? []).join('、') || '按澄清结果确定'}`,
@@ -312,31 +314,46 @@ export class Engine {
 
   /** 人撤回：执行器不能自我停止，只有这条路径能把工单置为 dropped */
   stopTicket(id, { actor, reason = '人工撤回' } = {}) {
-    const t = this.db.get('SELECT status FROM ticket WHERE id = ?', id);
-    if (!t) throw new UserError('ticket/not-found', `工单不存在：${id}`);
-    if (t.status === 'closed' || t.status === 'dropped') {
-      throw new UserError('ticket/settled', `工单 ${id} 已 ${t.status}，无需撤回`);
-    }
-    return this.transitionTicket(id, 'dropped', { note: reason, actor, force: true });
+    return this.db.tx(() => {
+      const t = this.getTicket(id);
+      this.assertTicketOperator(t, id, actor);
+      if (t.status === 'closed' || t.status === 'dropped') {
+        throw new UserError('ticket/settled', `工单 ${id} 已 ${t.status}，无需撤回`);
+      }
+      if (t.assignment?.status === 'working') throw new UserError('ticket/busy', `工单 ${id} 正在执行，请等待本轮结束`);
+      this.db.run("UPDATE assignment SET status = 'cancelled', ended_at = ?, note = ? WHERE ticket_id = ? AND status = 'queued'", this.now(), reason, id);
+      return this.transitionTicket(id, 'dropped', { note: reason, actor, force: true });
+    });
   }
 
   // ---------------------------------------------------------------- 派工
 
+  waitingGates(stage, taskType = null) {
+    // 量产质量响应需要独立于研发放行，避免延误客户问题的处理。
+    if (taskType === 'quality-8d') return [];
+    const enabled = this.manifest?.stages?.enabled ?? [];
+    return Object.values(GATES)
+      .filter((g) => g.deliverables.length && enabled.includes(g.stage) && g.stage < stage)
+      .filter((g) => this.getGate(g.id)?.status !== 'released')
+      .map((g) => g.id);
+  }
+
   claimNextAssignment() {
-    const row = this.db.get(
-      `SELECT a.id, a.ticket_id, a.attempt, a.workdir, t.title, t.task_type, t.stage, t.gate_target, t.severity, t.thread_id
-         FROM assignment a JOIN ticket t ON t.id = a.ticket_id
-        WHERE a.status = 'queued' AND t.status IN ('open','working','blocked')
-        ORDER BY a.rowid LIMIT 1`
-    );
-    if (!row) return null;
-    const at = this.now();
-    this.db.tx(() => {
+    if (this.policy.acceptMode !== 'auto') return null;
+    return this.db.tx(() => {
+      const row = this.db.all(
+        `SELECT a.id, a.ticket_id, a.attempt, a.workdir, t.title, t.task_type, t.stage, t.gate_target, t.severity, t.thread_id
+           FROM assignment a JOIN ticket t ON t.id = a.ticket_id
+          WHERE a.status = 'queued' AND t.status IN ('open','working','blocked')
+          ORDER BY a.rowid`
+      ).find((a) => !this.waitingGates(a.stage, a.task_type).length);
+      if (!row) return null;
+      const at = this.now();
       this.db.run("UPDATE assignment SET status = 'working', started_at = ? WHERE id = ?", at, row.id);
       this.db.run("UPDATE ticket SET status = 'working', updated_at = ? WHERE id = ? AND status <> 'working'", at, row.ticket_id);
       this.audit('executor', 'assignment.working', row.id, row.ticket_id);
+      return row;
     });
-    return row;
   }
 
   finishAssignment({ assignmentId, ticketId, status, note = null, ticketStatus = null, actor = 'executor' }) {
@@ -346,16 +363,39 @@ export class Engine {
       if (ticketStatus) {
         this.db.run('UPDATE ticket SET status = ?, updated_at = ?, blocked_reason = ? WHERE id = ?', ticketStatus, at, note, ticketId);
         this.audit(actor, `ticket.${ticketStatus}`, ticketId, note);
+        if (ticketStatus === 'review') {
+          const gateId = this.db.get('SELECT gate_target FROM ticket WHERE id = ?', ticketId)?.gate_target;
+          if (gateId && !this.unfinishedGateTickets(gateId).length) {
+            this.db.run("UPDATE gate SET status = 'preparing', updated_at = ? WHERE id = ? AND status = 'returned'", at, gateId);
+          }
+        }
       }
     });
   }
 
-  requeueAssignment({ assignmentId, ticketId }) {
-    const at = this.now();
-    this.db.tx(() => {
-      this.db.run("UPDATE assignment SET status = 'queued', note = ? WHERE id = ?", '重启恢复：重新入队', assignmentId);
-      this.db.run("UPDATE ticket SET status = 'working', updated_at = ? WHERE id = ?", at, ticketId);
-      this.audit('system', 'assignment.requeue', assignmentId, ticketId);
+  assertTicketOperator(ticket, id, actorId) {
+    if (!ticket) throw new UserError('ticket/not-found', `工单不存在：${id}`);
+    const canSign = ticket.gate_target && this.policy.canSign(actorId, ticket.gate_target).ok;
+    const canInitiate = this.policy.users.has(actorId) && this.policy.canInitiate(actorId, ticket.task_type).ok;
+    if (!canSign && !canInitiate) throw new UserError('ticket/forbidden', `无权操作工单 ${id}`);
+  }
+
+  retryTicket(id, { actorId }) {
+    return this.db.tx(() => {
+      const ticket = this.getTicket(id);
+      this.assertTicketOperator(ticket, id, actorId);
+      if (ticket.status !== 'blocked') throw new UserError('ticket/not-blocked', `工单 ${id} 当前是 ${ticket.status}，仅阻塞工单可重试`);
+      if (['queued', 'working'].includes(ticket.assignment?.status)) {
+        throw new UserError('ticket/retry-pending', `工单 ${id} 已有待执行派工`);
+      }
+      const attempt = (ticket.assignment?.attempt ?? 0) + 1;
+      const assignmentId = makeAssignmentId(id, attempt);
+      this.db.run(
+        'INSERT INTO assignment(id, ticket_id, attempt, status, workdir, note) VALUES(?,?,?,?,?,?)',
+        assignmentId, id, attempt, 'queued', null, '人工重新派工'
+      );
+      this.audit(actorId, 'assignment.retry', assignmentId, id);
+      return { assignmentId, attempt };
     });
   }
 
@@ -434,13 +474,40 @@ export class Engine {
     return this.getGate(gateId);
   }
 
-  /** 只刷新证据，不改状态：用于已签署/待签署的门禁 */
+  /** 退回期间更新缺口，保留退回状态直到修订或人工重提。 */
   updateGateChecks(gateId, checks) {
     this.db.run('UPDATE gate SET checks = ?, updated_at = ? WHERE id = ?', JSON.stringify(checks), this.now(), gateId);
     return this.getGate(gateId);
   }
 
+  unfinishedGateTickets(gateId) {
+    return this.db.all("SELECT id FROM ticket WHERE gate_target = ? AND status IN ('open','working','blocked')", gateId);
+  }
+
+  #assertGateChecks(gate) {
+    if (gate.checks.some((c) => !c.ok && !c.skipped) || this.waitingGates(gate.stage).length || this.unfinishedGateTickets(gate.id).length) {
+      throw new UserError('gate/checks-failed', `门禁 ${gate.id} 仍有未完成的前置检查`);
+    }
+  }
+
+  resubmitGate(gateId, { actorId }) {
+    return this.db.tx(() => {
+      const gate = this.getGate(gateId);
+      if (!gate) throw new UserError('gate/not-found', `门禁不存在：${gateId}`);
+      const permission = this.policy.canSign(actorId, gateId);
+      if (!permission.ok) throw new UserError('gate/forbidden', permission.reason);
+      if (gate.status !== 'returned') throw new UserError('gate/not-returned', `门禁 ${gateId} 当前是 ${gate.status}，仅已退回门禁可重提`);
+      this.#assertGateChecks(gate);
+      this.audit(actorId, 'gate.resubmitted', gateId);
+      return this.refreshGate(gateId, { status: 'pending', checks: gate.checks });
+    });
+  }
+
   signGate(gateId, { actorId, note = null }) {
+    return this.db.tx(() => this.#releaseGate(gateId, actorId, note));
+  }
+
+  #releaseGate(gateId, actorId, note) {
     const g = this.getGate(gateId);
     if (!g) throw new UserError('gate/not-found', `门禁不存在：${gateId}`);
     if (g.status !== 'pending') {
@@ -448,6 +515,7 @@ export class Engine {
     }
     const perm = this.policy.canSign(actorId, gateId);
     if (!perm.ok) throw new UserError('gate/forbidden', perm.reason, { code: 403 });
+    this.#assertGateChecks(g);
     const at = this.now();
     this.db.run(
       "UPDATE gate SET status = 'released', signed_by = ?, signed_at = ?, note = ?, updated_at = ? WHERE id = ?",
@@ -457,54 +525,72 @@ export class Engine {
     // 门禁放行 = 阶段完成：关闭所有指向该门且待评审的工单（docs/02 §4 状态对应表）
     const signer = this.policy.describe(actorId).name;
     const tickets = this.db.all(
-      "SELECT id, thread_id FROM ticket WHERE gate_target = ? AND status = 'review'", gateId
+      "SELECT id, thread_id, eval_id FROM ticket WHERE gate_target = ? AND status = 'review'", gateId
     );
-    const closedIds = [];
     for (const t of tickets) {
       try {
         this.transitionTicket(t.id, 'closed', {
           actor: actorId,
           note: `门禁 ${gateId} 已由 ${signer} 签署放行${note ? '：' + note : ''}`,
         });
-        closedIds.push(t.id);
+        this.enqueueOutbox({
+          kind: 'reply',
+          dedupeKey: `gate:${gateId}:${at}:${t.id}`,
+          triggerIds: this.getEval(t.eval_id)?.triggerIds,
+          payload: { threadId: t.thread_id, text: `门禁 ${gateId}（${g.name}）已由 ${signer} 放行，工单 ${t.id} 已关闭。` },
+        });
       } catch (err) {
         // 无有效产物的工单不能关闭，保留在 review 并在审计里留痕，避免静默跳过
         this.audit(actorId, 'ticket.close-skipped', t.id, `${gateId} 放行但无法关闭：${err.message}`);
       }
     }
-    this.enqueueOutbox({
-      kind: 'reply',
-      dedupeKey: `gate:${gateId}:${at}`,
-      payload: { threadId: null, text: `门禁 ${gateId}（${g.name}）已由 ${signer} 签署放行。`
-        + (closedIds.length ? `\n阶段完成，工单 ${closedIds.join('、')} 已关闭，可进入下一阶段。` : '') },
-    });
     return this.getGate(gateId);
   }
 
   returnGate(gateId, { actorId, reason }) {
-    const g = this.getGate(gateId);
-    if (!g) throw new UserError('gate/not-found', `门禁不存在：${gateId}`);
-    if (g.status !== 'pending') throw new UserError('gate/not-pending', `门禁 ${gateId} 当前是 ${g.status}`);
-    this.db.run("UPDATE gate SET status = 'returned', note = ?, updated_at = ? WHERE id = ?", reason, this.now(), gateId);
-    this.audit(actorId, 'gate.returned', gateId, reason);
-    // 门禁退回 = 阶段未通过：对应工单回到阻塞态，等待按原因修订后重交
-    const tickets = this.db.all(
-      "SELECT id FROM ticket WHERE gate_target = ? AND status IN ('review','working')", gateId
-    );
-    for (const t of tickets) {
-      this.transitionTicket(t.id, 'blocked', { actor: actorId, note: `门禁 ${gateId} 退回：${reason}` });
-    }
-    return this.getGate(gateId);
+    return this.db.tx(() => {
+      const g = this.getGate(gateId);
+      if (!g) throw new UserError('gate/not-found', `门禁不存在：${gateId}`);
+      if (g.status !== 'pending') throw new UserError('gate/not-pending', `门禁 ${gateId} 当前是 ${g.status}`);
+      const perm = this.policy.canSign(actorId, gateId);
+      if (!perm.ok) throw new UserError('gate/forbidden', perm.reason);
+      this.db.run("UPDATE gate SET status = 'returned', note = ?, updated_at = ? WHERE id = ?", reason, this.now(), gateId);
+      this.audit(actorId, 'gate.returned', gateId, reason);
+      const tickets = this.db.all("SELECT id, thread_id, eval_id FROM ticket WHERE gate_target = ? AND status = 'review'", gateId);
+      for (const t of tickets) {
+        this.transitionTicket(t.id, 'blocked', { actor: actorId, note: `门禁 ${gateId} 退回：${reason}` });
+        this.enqueueOutbox({
+          kind: 'reply',
+          dedupeKey: `gate-return:${gateId}:${this.now()}:${t.id}`,
+          triggerIds: this.getEval(t.eval_id)?.triggerIds,
+          payload: { threadId: t.thread_id, text: `工单 ${t.id} 的门禁 ${gateId} 已退回：${reason}` },
+        });
+      }
+      return this.getGate(gateId);
+    });
   }
 
   // ---------------------------------------------------------------- 外发
 
-  enqueueOutbox({ kind, dedupeKey, payload }) {
+  replyDestination(threadId, triggerIds = []) {
+    if (!threadId) return {};
+    const selected = triggerIds.length ? `AND id IN (${triggerIds.map(() => '?').join(',')})` : '';
+    const row = this.db.get(
+      `SELECT chat_id, meta FROM trigger WHERE thread_id = ? ${selected} ORDER BY addressed DESC, at DESC, rowid DESC LIMIT 1`,
+      threadId, ...triggerIds
+    );
+    if (!row) return {};
+    const meta = row.meta ? JSON.parse(row.meta) : {};
+    return { chatId: row.chat_id, messageId: meta.messageId ?? null };
+  }
+
+  enqueueOutbox({ kind, dedupeKey, payload, triggerIds }) {
     const at = this.now();
+    const destination = kind === 'reply' ? this.replyDestination(payload.threadId, triggerIds) : {};
     this.db.run(
       `INSERT INTO outbox(kind, dedupe_key, payload, status, attempts, next_at, created_at)
        VALUES(?,?,?, 'pending', 0, ?, ?) ON CONFLICT(dedupe_key) DO NOTHING`,
-      kind, dedupeKey, JSON.stringify(payload), at, at
+      kind, dedupeKey, JSON.stringify({ ...destination, ...payload }), at, at
     );
   }
 
@@ -592,7 +678,7 @@ export class Engine {
         ${status ? 'WHERE a.status = ?' : ''}
         ORDER BY a.rowid DESC LIMIT ?`,
       ...(status ? [status, limit] : [limit])
-    );
+    ).map((a) => ({ ...a, waitingOn: a.status === 'queued' ? this.waitingGates(a.stage, a.taskType) : [] }));
   }
 
   /** 交付物清单：带工单任务类型与门禁，工作台据此回答"这批活产出了什么" */

@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeRuntime, seedKeysFile, cleanup } from './helpers.mjs';
+import { makeRuntime, seedKeysFile, cleanup, say } from './helpers.mjs';
 import { createPanelServer } from '../src/panel/server.mjs';
 
 const H = { 'x-superagent-request': '1', 'content-type': 'application/json' };
 const SECRET = 'sk-aaaaaaaaaaaaaaaaaaaa';
 
-async function boot(t, { pools } = {}) {
+async function boot(t, { pools, env } = {}) {
   const keysFile = await seedKeysFile(pools ?? {
     worker: {
       model: 'model-strong',
@@ -14,7 +14,7 @@ async function boot(t, { pools } = {}) {
       keys: [{ id: 'w1', apiKey: SECRET }],
     },
   });
-  const { dir, runtime } = await makeRuntime({ stages: ['S1'], keysFile });
+  const { dir, runtime } = await makeRuntime({ stages: ['S1'], keysFile, env, aiFill: false });
   const panel = createPanelServer({ runtime, port: 0 });
   const { url } = await panel.listen();
   t.after(async () => {
@@ -116,4 +116,24 @@ test('工作台：model.yml 基线的池在界面上标注来源', async (t) => 
   assert.equal(r.body.totals.keys, 0);
   assert.equal(r.body.pools.length, 4, '标准池始终展示，便于新增');
   assert.ok(r.body.pools.every((p) => p.ownedBy === 'model.yml'));
+});
+
+test('工作台：门禁 API 只使用服务端验证过的签署身份', async (t) => {
+  const pm = 'temporary-project-manager-token-for-tests';
+  const sw = 'temporary-software-engineer-token-for-tests';
+  const { api, runtime } = await boot(t, { env: { SUPERAGENT_OPERATOR_TOKENS: JSON.stringify({ ou_xxx3: pm, ou_xxx4: sw }) } });
+  await say(runtime.project.root, { actor: 'ou_xxx3', text: '启动项目立项' });
+  await runtime.tick();
+  assert.equal(runtime.engine.getGate('G1').status, 'pending');
+
+  const post = (action, credential) => api(`/api/gates/G1/${action}`, {
+    method: 'POST',
+    headers: credential ? { authorization: `Bearer ${credential}` } : {},
+    body: JSON.stringify({ note: '同意', reason: '补充材料' }),
+  });
+  assert.equal((await post('sign')).status, 401);
+  assert.equal((await post('return', sw)).status, 403);
+  assert.equal(runtime.engine.getGate('G1').status, 'pending');
+  assert.equal((await post('sign', pm)).status, 200);
+  assert.equal(runtime.engine.getGate('G1').status, 'released');
 });

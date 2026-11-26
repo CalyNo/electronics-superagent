@@ -4,10 +4,10 @@
 import path from 'node:path';
 import { loadProject, loadPolicy, assertStricter, effectiveRules, ConfigError } from '../config/load.mjs';
 import { openDb } from '../store/db.mjs';
-import { Engine } from '../domain/engine.mjs';
+import { Engine, UserError } from '../domain/engine.mjs';
 import { createPolicy } from '../domain/policy.mjs';
 import { planFor } from '../domain/stages.mjs';
-import { refreshGates } from '../domain/gate.mjs';
+import { refreshGate, refreshGates } from '../domain/gate.mjs';
 import { clarifyQuestion } from '../domain/router.mjs';
 import { createLocalSource } from '../sources/local.mjs';
 import { createFeishuSource } from '../sources/feishu.mjs';
@@ -48,11 +48,12 @@ export class Runtime {
     const db = await openDb(project.paths.state);
     const policyObj = createPolicy({ policy, manifest: project.manifest });
     const engine = new Engine({ db, policy: policyObj, manifest: project.manifest });
-    const recovered = engine.recover();
+    const recovered = options.recover === false ? { recoveredAssignments: 0 } : engine.recover();
 
     let source = null;
     let sourceError = null;
     const sourceKind = options.source ?? 'local';
+    const receivedViaWebhook = { received: 0, duplicate: 0 };
     if (sourceKind === 'feishu') {
       const env = options.env ?? process.env;
       source = createFeishuSource({
@@ -60,8 +61,13 @@ export class Runtime {
         appSecret: env.FEISHU_APP_SECRET,
         verificationToken: env.FEISHU_VERIFICATION_TOKEN,
         botOpenId: env.FEISHU_BOT_OPEN_ID ?? null,
+        onEvent(event) {
+          const result = engine.receive(event);
+          receivedViaWebhook[result.status === 'duplicate' ? 'duplicate' : 'received'] += 1;
+          return result;
+        },
       });
-      if (!source) sourceError = '缺少 FEISHU_APP_ID / FEISHU_APP_SECRET，飞书来源未启用（退出码 3）';
+      if (!source) sourceError = '需要 FEISHU_APP_ID、FEISHU_APP_SECRET 和 FEISHU_VERIFICATION_TOKEN，飞书来源未启用（退出码 3）';
     } else {
       source = createLocalSource({ projectDir: project.root });
     }
@@ -110,17 +116,24 @@ export class Runtime {
 
     const rt = new Runtime({
       project, policy, policyObj, policyFile: resolvedPolicy, policyErrors,
-      rules, db, engine, source, sourceError, sourceKind, model, modelInfo, pool, keys, env, options, recovered,
+      rules, db, engine, source, sourceError, sourceKind, model, modelInfo, pool, keys, env, options, recovered, receivedViaWebhook,
     });
 
-    if (source) await source.start();
+    try {
+      if (source) await source.start();
+    } catch (error) {
+      await rt.close();
+      throw error;
+    }
     return rt;
   }
 
   // ------------------------------------------------------------- 主循环
 
   async tick() {
-    const summary = { received: 0, duplicate: 0, evaluated: 0, accepted: 0, rejected: 0, clarified: 0, executed: 0, gates: [], errors: [] };
+    const summary = { ...this.receivedViaWebhook, evaluated: 0, accepted: 0, rejected: 0, clarified: 0, executed: 0, gates: [], errors: [] };
+    this.receivedViaWebhook.received = 0;
+    this.receivedViaWebhook.duplicate = 0;
 
     if (!this.source) {
       this.errors.push(this.sourceError ?? '来源未就绪');
@@ -140,35 +153,16 @@ export class Runtime {
     }
 
     for (const t of this.engine.pendingThreads()) {
-      let ev;
       try {
-        ev = this.engine.evaluate(t.threadId);
+        const outcome = this.engine.db.tx(() => this.evaluateThread(t.threadId));
+        if (!outcome) continue;
+        summary.evaluated += 1;
+        if (['accepted', 'rejected', 'clarified'].includes(outcome)) summary[outcome] += 1;
       } catch (err) {
-        summary.errors.push(`评估失败 ${t.threadId}：${err.message}`);
-        continue;
+        const message = `评估或接单失败 ${t.threadId}：${err.message}`;
+        summary.errors.push(message);
+        this.errors.push(message);
       }
-      if (!ev) continue;
-      summary.evaluated += 1;
-
-      if (ev.status === 'context') continue;
-
-      if (ev.status === 'rejected') {
-        summary.rejected += 1;
-        // 只在被点名时说明原因：陌生人未 @ 的请求静默处理，不占用注意力
-        if (this.wasAddressed(t.threadId)) {
-          this.replyToThread(t.threadId, `这条请求没有进入工单：${ev.reason}`);
-        }
-        continue;
-      }
-      if (ev.verdict === 'clarify') {
-        summary.clarified += 1;
-        this.replyToThread(t.threadId, clarifyQuestion(ev.assessment));
-        continue;
-      }
-
-      const acc = this.engine.accept(ev.id, { actor: 'engine' });
-      if (acc.status === 'accepted') summary.accepted += 1;
-      else if (acc.status === 'observed') this.replyToThread(t.threadId, `observe 模式：本会接单（${ev.assessment?.taskType}）。切到 auto 后才会实际开工。`);
     }
 
     // 串行执行：保证仓库不被并发写（docs/00 §7）
@@ -190,6 +184,27 @@ export class Runtime {
     return summary;
   }
 
+  evaluateThread(threadId) {
+    // 触发消费、接单和回复入队同一事务，失败后仍可处理已确认收件的消息。
+    const evaluation = this.engine.evaluate(threadId);
+    if (!evaluation || evaluation.status === 'context') return evaluation?.status;
+
+    const destination = { triggerIds: evaluation.triggerIds };
+    if (evaluation.status === 'rejected') {
+      if (this.wasAddressed(threadId)) this.replyToThread(threadId, `这条请求没有进入工单：${evaluation.reason}`, destination);
+      return 'rejected';
+    }
+    if (evaluation.verdict === 'clarify') {
+      this.replyToThread(threadId, clarifyQuestion(evaluation.assessment), destination);
+      return 'clarified';
+    }
+    const result = this.engine.accept(evaluation.id, { actor: 'engine' });
+    if (result.status === 'observed') {
+      this.replyToThread(threadId, `observe 模式：本会接单（${evaluation.assessment?.taskType}）。切到 auto 后才会实际开工。`, destination);
+    }
+    return result.status;
+  }
+
   async executeOne(assignment, summary) {
     const ticket = this.engine.getTicket(assignment.ticket_id);
     if (!ticket) return;
@@ -206,8 +221,14 @@ export class Runtime {
 
     // 工单原文交给岗位当"唯一事实来源"：模型只能依据它写，不得自行补事实
     const history = this.engine.history(ticket.id);
-    const inputText = (history?.triggers ?? []).map((t) => t.body).join('\n---\n');
-    plan.inputText = inputText;
+    const input = (history?.triggers ?? []).map((t) => t.body);
+    if (assignment.attempt > 1 && ticket.blocked_reason) {
+      input.push(`上轮退回或阻塞原因：${ticket.blocked_reason}`);
+      if (plan.codeTargets) {
+        plan.codeTargets = plan.codeTargets.map((target) => ({ ...target, notes: [target.notes, ticket.blocked_reason].filter(Boolean).join('\n') }));
+      }
+    }
+    plan.inputText = input.join('\n---\n');
 
     try {
       const result = await runAssignment({
@@ -221,6 +242,7 @@ export class Runtime {
           budget: this.modelInfo?.budget,
           aiFill: this.options.aiFill !== false,
           codeModifier: this.options.codeModifier ?? null,
+          firmwareBuild: this.options.firmwareBuild,
         },
       });
 
@@ -234,11 +256,11 @@ export class Runtime {
           note: result.notes.join(' | ').slice(0, 500) || null, ticketStatus: 'review',
         });
         this.replyToThread(ticket.thread_id,
-          `${ticket.id} 已产出 ${result.assets.length} 份文档并提交到 ${result.commit?.branch ?? '(未提交)'}：\n`
+          `${ticket.id} 已产出 ${result.assets.length} 项交付物${result.commit?.sha ? `，提交到 ${result.commit.branch}` : '（未提交）'}：\n`
           + result.assets.map((a) => `· ${a.relPath}`).join('\n')
           + (result.prDraftPath ? `\nPR 草案：${result.prDraftPath}` : '')
           + (ticket.gate_target ? `\n门禁 ${ticket.gate_target} 需人工签署后才可进入下一阶段。` : ''),
-          ticket.id);
+          { ticketId: ticket.id, triggerIds: ev?.triggerIds });
       } else {
         this.engine.addReport({
           ticketId: ticket.id, assignmentId: assignment.id, kind: result.status,
@@ -249,7 +271,7 @@ export class Runtime {
           note: (result.reason ?? '').slice(0, 500), ticketStatus: 'blocked',
         });
         this.replyToThread(ticket.thread_id,
-          `${ticket.id} 暂停在阻塞状态：${result.reason}\n需要人工处理后重试。`, ticket.id);
+          `${ticket.id} 暂停在阻塞状态：${result.reason}\n需要人工处理后重试。`, { ticketId: ticket.id, triggerIds: ev?.triggerIds });
       }
     } catch (err) {
       summary.errors.push(`执行失败 ${ticket.id}：${err.message}`);
@@ -264,9 +286,9 @@ export class Runtime {
 
   // ------------------------------------------------------------- 回写
 
-  replyToThread(threadId, text, ticketId = null) {
+  replyToThread(threadId, text, { ticketId = null, triggerIds } = {}) {
     const key = ticketId ? `msg:${ticketId}:${Date.now()}` : `msg:${threadId}:${Date.now()}:${text.length}`;
-    this.engine.enqueueOutbox({ kind: 'reply', dedupeKey: key, payload: { threadId, text } });
+    this.engine.enqueueOutbox({ kind: 'reply', dedupeKey: key, triggerIds, payload: { threadId, text } });
   }
 
   wasAddressed(threadId) {
@@ -276,20 +298,12 @@ export class Runtime {
     return !!row?.addressed;
   }
 
-  chatOfThread(threadId) {
-    if (!threadId) return null;
-    const row = this.engine.db.get(
-      'SELECT chat_id FROM trigger WHERE thread_id = ? ORDER BY at DESC LIMIT 1', threadId
-    );
-    return row?.chat_id ?? null;
-  }
-
   async flushOutbox() {
     for (const row of this.engine.dueOutbox()) {
       const payload = JSON.parse(row.payload);
-      const chatId = payload.chatId ?? this.chatOfThread(payload.threadId);
       try {
-        await this.source.send({ text: payload.text, chatId, threadId: payload.threadId, dedupeKey: row.dedupe_key });
+        const fallback = payload.chatId === undefined ? this.engine.replyDestination(payload.threadId) : {};
+        await this.source.send({ ...fallback, ...payload, dedupeKey: row.dedupe_key });
         this.engine.markOutboxSent(row.id);
       } catch (err) {
         const attempts = row.attempts + 1;
@@ -297,6 +311,24 @@ export class Runtime {
         this.engine.markOutboxFailed(row.id, err.message, attempts, new Date(Date.now() + delay).toISOString());
       }
     }
+  }
+
+  checkGate(gateId) {
+    return refreshGate({ gateId, project: this.project, engine: this.engine, rules: this.rules });
+  }
+
+  async signGate(gateId, { actorId, note = null }) {
+    const permission = this.policyObj.canSign(actorId, gateId);
+    if (!permission.ok) throw new UserError('gate/forbidden', permission.reason);
+    await this.checkGate(gateId);
+    return this.engine.signGate(gateId, { actorId, note });
+  }
+
+  async resubmitGate(gateId, { actorId }) {
+    const permission = this.policyObj.canSign(actorId, gateId);
+    if (!permission.ok) throw new UserError('gate/forbidden', permission.reason);
+    await this.checkGate(gateId);
+    return this.engine.resubmitGate(gateId, { actorId });
   }
 
   // ------------------------------------------------------------- 运行与状态
@@ -390,7 +422,7 @@ export class Runtime {
       status: this.status(),
       attention: {
         tickets: attention,
-        gates: gates.filter((g) => g.status === 'pending' || g.status === 'preparing'),
+        gates: gates.filter((g) => ['pending', 'preparing', 'returned'].includes(g.status)),
       },
       recent: this.engine.listTickets({ limit: 10 }),
       evals: this.engine.listEvals(10).map((e) => ({

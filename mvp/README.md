@@ -5,7 +5,7 @@
 
 - 运行时：Node.js ≥ 22.5（用到内置 `node:sqlite`；实测 22.22）
 - 依赖：**0**（无 npm 包，克隆即可运行）
-- 测试：`node --test test/*.test.mjs`，62 项通过
+- 测试：`npm test`，基于临时项目、Git 仓库及模拟接口
 
 ## 1. 三分钟跑通
 
@@ -74,7 +74,8 @@ node src/cli.mjs gate  sign  G1 --dir ./pcu24 --as ou_xxx3 --note "立项评审�
 | `status` | 一次健康检查（`--json`） |
 | `say` | 投递消息（`--as --chat --id --not-addressed`） |
 | `tickets` | 列表 / `--id` 看全链路 |
-| `gate` | `list｜check <G>｜sign <G> --as｜return <G> --as` |
+| `retry` | `retry <ticket_id> --dir <项目> --as <open_id>`，为阻塞工单创建下一次派工 |
+| `gate` | `list｜check <G>｜sign/return/resubmit <G> --as <open_id>` |
 | `model` | 查看模型网关配置（`--file`），`--check` 发一条最小请求自检 |
 | `verify` | 配置 + 文档结构 + 资产落位 + 门禁 全量校验 |
 | `classify` | 查看文件会归到哪个目录 |
@@ -151,7 +152,7 @@ budget:
 | **岗位状态** | 谁在干活、谁空闲、谁没 key | 每个岗位：`在干活 / 空闲 / 无可用密钥`、当前工单与开始时间、最近一次调用（用途/tokens/多久前）、今日用量、可用模型 |
 | 执行与队列 | 卡在哪一步 | 每张派工的状态与备注（为什么 blocked、AI 填了几节） |
 | **交付物** | 产出了什么 | 文档类型、所属工单、阶段、结构校验结果、**AI 草稿 / 骨架**、文件路径、产出时间 |
-| 阶段门 | 缺什么才能放行 | 门禁状态、缺口清单、签署人（签署仍回运行面板，人签） |
+| 阶段门 | 缺什么才能放行 | 门禁状态、缺口清单、签署人和授权操作 |
 | 密钥与池 | key 能不能用、钱花在哪 | 每个池的 key 列表（掩码）、可用/停用/环境变量缺失、累计用量、最近自检结果 |
 
 密钥管理是就地可写的：新增、停用、换 key、改模型/baseUrl、单把自检、删除、改预算。保存后立即重建运行时池，**不需要重启进程**。
@@ -163,9 +164,13 @@ budget:
 | `~/.superagent/model.yml` | 人 | 声明式基线：默认网关、池、预算 |
 | `~/.superagent/keys.json` | 工作台 | 运行时密钥库；某个池只要在这里出现，就以它为准（整组覆盖） |
 
-安全边界：页面只绑 `127.0.0.1`，写操作需自定义请求头 `x-superagent-request: 1`，接口只回掩码、不回明文；密钥文件权限 0600。**这是本机明文存储**，多人共用或需要审计时应换 Vault/KMS + 本地网关（`docs/08` §6）。
+工作台通过回环监听器提供。写接口要求 `x-superagent-request: 1`。签署、退回、撤回和重试还需要 `Authorization: Bearer <操作员令牌>`。服务端从进程环境变量 `SUPERAGENT_OPERATOR_TOKENS` 读取 `open_id → 令牌` 的 JSON 对象，并按项目策略核对角色。为每人使用独立的随机令牌，可用 `node -p "require('node:crypto').randomBytes(32).toString('base64url')"` 生成。工作台输入的令牌用完即清空，未配置身份时可由本机受信任的运维人员使用 CLI 操作。
+
+模型密钥存于用户主目录，接口只返回掩码。飞书事件入口单独对外转发时，只开放 `/feishu/event`。
 
 对应接口：`GET /api/workbench`（聚合视图）、`GET /api/keys`、`POST /api/keys`、`PATCH|DELETE /api/keys/:pool/:id`、`POST /api/keys/:pool/:id/test`、`PUT /api/keys/budget`。
+
+下阶段工单在前置门禁放行前留在队列里。量产 8D 独立执行。签署即刻重查交付物。门禁退回后，关联工单可重试。没有关联待办时，有签署权限的人可在补齐证据后用 `gate resubmit <G> --dir <项目> --as <open_id>` 重新提审。
 
 ## 7. 刻意不做的事
 
@@ -179,7 +184,7 @@ budget:
 
 ## 8. 落地到真实环境
 
-1. **接飞书**：设 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_VERIFICATION_TOKEN`，回调 `POST /feishu/event`；`--source feishu` 启动。
+1. **接飞书**。设 `FEISHU_APP_ID`、`FEISHU_APP_SECRET` 和 `FEISHU_VERIFICATION_TOKEN`，以 `--source feishu` 启动。需要群聊触发时设置 `FEISHU_BOT_OPEN_ID`。启用 `im.message.receive_v1` 并将 HTTPS 回调转发给 `POST /feishu/event`。事件落库后才确认，处理结果回复原消息。
 2. **改策略**：把 `.superagent/policy.yml` 里的 `ou_xxx*` 换成真实 `open_id`，`admission` 的群 ID 换成真实群。
 3. **配模型密钥**（可选，不配也能跑，只是不生成技术内容）：
 
@@ -196,7 +201,25 @@ budget:
    **不要**把密钥写进 `.superagent/*.yml` 或任何会被提交的文件——那等于把凭据写进 Git 历史。
 4. **接真实 PR**：`executor/repo.mjs` 已生成 PR 草案 `.md`，接 `gh pr create` 或平台 API 即可（默认不开，需显式开启）。
 
-## 9. 已知限制
+## 9. 固件修改与编译
+
+在授权工单中明确给出应用层 `.c` 或 `.h` 的项目相对路径，例如 `firmware/app/main.c`。启用 S2，并先放行项目启用的前置阶段门。在项目自己的 `.superagent/manifest.yml` 的现有 `integrations` 节点下增加构建配置。
+
+```yaml
+integrations:
+  firmware:
+    build:
+      executable: cmake
+      args: ["--build", "build"]
+      cwd: "."
+      timeoutMs: 300000
+```
+
+构建命令由维护者配置，替换成项目已经使用的工具和参数。Windows 下可指定编译器的绝对路径。目标源码需使用 UTF-8。执行器会先备份原文件，再应用候选源码并执行构建。构建失败时恢复本次写入的源码并把工单标为阻塞。修复原因后，可从工作台重试或执行 `retry <ticket_id> --dir <项目> --as <open_id>`。每次重试保留历史派工记录。
+
+在提供 `agentPresets` 服务的 DSH profile 中加载 bundle，例如 `web` profile。将 profile 的 `node_modules/@local/electronics-superagent` 链接到完整 checkout 中的 `dsh-bundle` 目录，再把 `@local/electronics-superagent` 加到该 profile 的 `package.json` 的 `dsh.profile.bundles`。设置 `SUPERAGENT_PROJECT_DIR` 指向已初始化的目标项目。来源默认 `local`，接飞书时设置 `SUPERAGENT_SOURCE=feishu`。软件工程师 preset 使用 DSH 当前默认模型生成候选源码，共用 MVP 的构建与提交流程。
+
+## 10. 已知限制
 
 - **堆叠分支**：每张工单分支基于上一张，使工作区文档持续累积；PR 需按顺序评审。生产应改为 worktree 从 `develop` 拉出（docs/00 §10 已记录）。
 - **路由是关键词**：复杂或含糊需求会落到 `clarify`，只问一句。这是设计内行为，不是缺陷。

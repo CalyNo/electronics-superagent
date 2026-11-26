@@ -1,41 +1,54 @@
-// 飞书来源适配器（真实实现，非桩）：
-//   - webhook 事件接收（含 url_verification 握手）
-//   - tenant_access_token 获取与缓存
-//   - 发消息回写
-// 无凭据时构造返回 null，由 runtime 明确提示"未启用"，而不是启动即崩。
-//
-// 安全边界：本文件只做协议转换，不做准入判断（准入在 domain/policy.mjs）。
-// 事件签名：MVP 校验 verification token；加密事件（encrypt_key）未实现，遇到时明确报错而非静默丢。
+// 飞书协议边界。业务准入由 domain/policy.mjs 判定。
+
+import { stableKey } from '../util/ids.mjs';
 
 const BASE = 'https://open.feishu.cn/open-apis';
+const REQUEST_TIMEOUT_MS = 10_000;
 
-export function createFeishuSource({ appId, appSecret, verificationToken, botOpenId = null }) {
-  if (!appId || !appSecret) return null;
+export function createFeishuSource({ appId, appSecret, verificationToken, botOpenId = null, onEvent = null }) {
+  if (!appId || !appSecret || typeof verificationToken !== 'string' || !verificationToken.trim()) return null;
 
   let token = null;
   let tokenExpireAt = 0;
+  let tokenRequest = null;
   const queue = [];
-  const seen = new Set(); // event_id 去重（进程内；跨重启由 store 的 external_id 兜底）
+  const seen = new Set();
 
-  async function request(path, { method = 'POST', body = null, query = '' } = {}) {
+  async function request(path, body, accessToken = null) {
     const headers = { 'content-type': 'application/json; charset=utf-8' };
-    if (token) headers.authorization = `Bearer ${await getToken()}`;
-    const res = await fetch(`${BASE}${path}${query}`, {
-      method, headers, body: body ? JSON.stringify(body) : undefined,
+    if (accessToken) headers.authorization = `Bearer ${accessToken}`;
+    const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const res = await fetch(`${BASE}${path}`, {
+      method: 'POST', headers, body: JSON.stringify(body), signal,
     });
-    const data = await res.json().catch(() => ({}));
-    if (data.code && data.code !== 0) throw new Error(`飞书接口 ${path} 返回 ${data.code}: ${data.msg}`);
-    return data;
+    if (!res.ok) throw new Error(`飞书接口 ${path} 返回 HTTP ${res.status}`);
+    const data = await res.json().catch((err) => {
+      if (signal.aborted) throw signal.reason;
+      if (!(err instanceof SyntaxError)) throw err;
+      throw new Error(`飞书接口 ${path} 返回无效 JSON`);
+    });
+    if (data?.code === 0) return data;
+    if (typeof data?.code !== 'number') throw new Error(`飞书接口 ${path} 返回无效响应`);
+    throw new Error(`飞书接口 ${path} 返回 ${data.code}：${data.msg}`);
+  }
+
+  async function refreshToken() {
+    const data = await request('/auth/v3/tenant_access_token/internal', {
+      app_id: appId, app_secret: appSecret,
+    });
+    if (typeof data.tenant_access_token !== 'string' || !data.tenant_access_token.trim()
+      || !Number.isFinite(data.expire) || data.expire <= 0) {
+      throw new Error('飞书接口返回的 tenant_access_token 或有效期无效');
+    }
+    token = data.tenant_access_token;
+    tokenExpireAt = Date.now() + data.expire * 1000;
+    return token;
   }
 
   async function getToken() {
     if (token && Date.now() < tokenExpireAt - 60_000) return token;
-    const data = await request('/auth/v3/tenant_access_token/internal', {
-      body: { app_id: appId, app_secret: appSecret },
-    });
-    token = data.tenant_access_token;
-    tokenExpireAt = Date.now() + (data.expire ?? 7200) * 1000;
-    return token;
+    tokenRequest ??= refreshToken().finally(() => { tokenRequest = null; });
+    return tokenRequest;
   }
 
   function toEvent(payload) {
@@ -54,6 +67,8 @@ export function createFeishuSource({ appId, appSecret, verificationToken, botOpe
     // 去掉 @ 占位符，正文才是研判输入
     text = text.replace(/@_user_\d+/g, '').trim();
 
+    const mentionsBot = !!botOpenId && Array.isArray(msg.mentions)
+      && msg.mentions.some((mention) => mention?.id?.open_id === botOpenId);
     return {
       source: 'feishu',
       externalId: payload.header?.event_id ?? msg.message_id,
@@ -63,7 +78,7 @@ export function createFeishuSource({ appId, appSecret, verificationToken, botOpe
       chatId: msg.chat_id,
       body: text,
       at: new Date(Number(msg.create_time) || Date.now()).toISOString(),
-      addressed: Array.isArray(msg.mentions) && msg.mentions.length > 0,
+      addressed: msg.chat_type === 'p2p' || mentionsBot,
       meta: { chatType: msg.chat_type, messageId: msg.message_id },
     };
   }
@@ -75,10 +90,10 @@ export function createFeishuSource({ appId, appSecret, verificationToken, botOpe
       await getToken();
     },
 
-    /** webhook 入口：返回给飞书的响应体；事件进队列等 poll 取走 */
+    /** 运行时提供 onEvent 时，先落库再向飞书确认接收。 */
     async handleEvent(body) {
       if (body?.type === 'url_verification') {
-        if (verificationToken && body.token !== verificationToken) {
+        if (body.token !== verificationToken) {
           const err = new Error('url_verification token 不匹配');
           err.status = 403;
           throw err;
@@ -91,19 +106,26 @@ export function createFeishuSource({ appId, appSecret, verificationToken, botOpe
         throw err;
       }
       const header = body?.header ?? {};
-      if (verificationToken && header.token && header.token !== verificationToken) {
+      if (header.token !== verificationToken) {
         const err = new Error('事件 token 不匹配');
         err.status = 403;
         throw err;
       }
-      const id = header.event_id;
+      if (header.event_type !== 'im.message.receive_v1') return { ok: true };
+      const evt = toEvent(body);
+      if (!evt) return { ok: true };
+      if (onEvent) {
+        const received = await onEvent(evt);
+        return received?.status === 'duplicate' ? { ok: true, duplicate: true } : { ok: true };
+      }
+
+      const id = evt.externalId;
       if (id && seen.has(id)) return { ok: true, duplicate: true };
       if (id) {
         seen.add(id);
         if (seen.size > 500) seen.delete(seen.values().next().value);
       }
-      const evt = toEvent(body);
-      if (evt) queue.push(evt);
+      queue.push(evt);
       return { ok: true };
     },
 
@@ -112,16 +134,16 @@ export function createFeishuSource({ appId, appSecret, verificationToken, botOpe
     },
 
     async send(reply) {
-      if (!reply.chatId) throw new Error('飞书回复缺少 chatId');
-      await request('/im/v1/messages', {
-        query: '?receive_id_type=chat_id',
-        body: {
-          receive_id: reply.chatId,
-          msg_type: 'text',
-          content: JSON.stringify({ text: reply.text }),
-        },
-      });
-      return { ok: true, ref: reply.dedupeKey ?? null };
+      const { messageId, chatId, text, dedupeKey } = reply;
+      if (!messageId && !chatId) throw new Error('飞书回复缺少 messageId 或 chatId');
+      const body = { msg_type: 'text', content: JSON.stringify({ text }) };
+      if (dedupeKey) body.uuid = stableKey(messageId || chatId, dedupeKey);
+      const path = messageId
+        ? `/im/v1/messages/${encodeURIComponent(messageId)}/reply`
+        : '/im/v1/messages?receive_id_type=chat_id';
+      if (!messageId) body.receive_id = chatId;
+      await request(path, body, await getToken());
+      return { ok: true, ref: dedupeKey ?? null };
     },
 
     async stop() { /* 无长连接 */ },

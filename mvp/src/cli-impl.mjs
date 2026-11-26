@@ -116,7 +116,11 @@ async function cmdRun(args) {
   } else {
     console.log(C.dim('   未配置模型池：流程照跑，文档只出骨架'));
   }
-  if (s.source.error) console.log(C.yellow(`   ${s.source.error}`));
+  if (s.source.error) {
+    console.error(C.yellow(`   ${s.source.error}`));
+    await runtime.close();
+    return s.gateExitCode;
+  }
 
   let panel = null;
   if (args['no-panel'] !== true && args.once !== true) {
@@ -163,7 +167,7 @@ async function cmdRun(args) {
 
 async function cmdStatus(args) {
   const dir = path.resolve(need(args, 'dir', 'status 需要 --dir'));
-  const runtime = await Runtime.create({ dir, options: { source: args.source ?? 'local', policyFile: args.policy } });
+  const runtime = await Runtime.create({ dir, options: { source: args.source ?? 'local', policyFile: args.policy, recover: false } });
   const s = runtime.status();
   if (args.json) console.log(JSON.stringify(s, null, 2));
   else {
@@ -184,7 +188,7 @@ async function cmdStatus(args) {
 
 async function cmdTickets(args) {
   const dir = path.resolve(need(args, 'dir', 'tickets 需要 --dir'));
-  const runtime = await Runtime.create({ dir, options: { policyFile: args.policy } });
+  const runtime = await Runtime.create({ dir, options: { policyFile: args.policy, recover: false } });
   try {
     if (args.id) {
       const h = runtime.engine.history(String(args.id));
@@ -215,7 +219,7 @@ async function cmdTickets(args) {
 async function cmdGate(args) {
   const dir = path.resolve(need(args, 'dir', 'gate 需要 --dir'));
   const sub = args._[1] ?? 'list';
-  const runtime = await Runtime.create({ dir, options: { policyFile: args.policy } });
+  const runtime = await Runtime.create({ dir, options: { policyFile: args.policy, recover: false } });
   try {
     if (sub === 'list') {
       const rows = runtime.engine.listGates().map((g) => [g.id, g.name, g.status, g.signed_by ?? '-', (g.checks ?? []).filter((c) => !c.ok).length + ' 项缺口']);
@@ -224,18 +228,18 @@ async function cmdGate(args) {
     }
     if (sub === 'check') {
       const gateId = args._[2] ?? 'G1';
-      const res = await runGateChecks({ gateId, project: await loadProject(dir), rules: effectiveRules((await loadProject(dir)).rules) });
-      console.log(`${C.bold(gateId)} ${res.name} → ${res.status === 'pending' ? C.yellow('待签署') : C.red('检查未通过')}`);
+      const res = await runtime.checkGate(gateId);
+      console.log(`${C.bold(gateId)} ${res.name} → ${res.status}`);
       for (const c of res.checks) {
         console.log(`  ${c.ok ? OK() : c.skipped ? C.yellow('○') : NO()} ${c.id}  ${C.dim(c.detail ?? '')}`);
       }
-      return res.status === 'pending' ? 0 : 2;
+      return ['pending', 'released'].includes(res.status) ? 0 : 2;
     }
     if (sub === 'sign') {
       const gateId = args._[2] ?? 'G1';
       const who = need(args, 'as', 'gate sign 需要 --as <open_id>');
       try {
-        const g = runtime.engine.signGate(gateId, { actorId: who, note: args.note ?? null });
+        const g = await runtime.signGate(gateId, { actorId: who, note: args.note ?? null });
         console.log(`${OK()} ${gateId} 已由 ${g.signed_by} 放行（${g.signed_at}）`);
         return 0;
       } catch (err) {
@@ -250,8 +254,30 @@ async function cmdGate(args) {
       console.log(`${OK()} ${gateId} 已退回`);
       return 0;
     }
-    console.error(`未知子命令：${sub}（list|check|sign|return）`);
+    if (sub === 'resubmit') {
+      const gateId = args._[2] ?? 'G1';
+      const actorId = need(args, 'as', 'gate resubmit 需要 --as <open_id>');
+      await runtime.resubmitGate(gateId, { actorId });
+      console.log(`${OK()} ${gateId} 已重新提交待签署`);
+      return 0;
+    }
+    console.error(`未知子命令：${sub}（list|check|sign|return|resubmit）`);
     return 2;
+  } finally {
+    await runtime.close();
+  }
+}
+
+async function cmdRetry(args) {
+  const ticketId = args._[1];
+  if (!ticketId) throw new Error('retry 需要工单编号');
+  const dir = path.resolve(need(args, 'dir', 'retry 需要 --dir'));
+  const actorId = need(args, 'as', 'retry 需要 --as <open_id>');
+  const runtime = await Runtime.create({ dir, options: { policyFile: args.policy, recover: false } });
+  try {
+    const retry = runtime.engine.retryTicket(ticketId, { actorId });
+    console.log(`${OK()} ${ticketId} 第 ${retry.attempt} 次派工已排队`);
+    return 0;
   } finally {
     await runtime.close();
   }
@@ -434,13 +460,13 @@ async function cmdDemo(args) {
 
   step(`\n${C.bold('⑥ 签署权校验')}`);
   try {
-    runtime.engine.signGate('G1', { actorId: 'ou_xxx4', note: '代签测试' });
+    await runtime.signGate('G1', { actorId: 'ou_xxx4', note: '代签测试' });
     step(`   ${NO()} 不应成功：ou_xxx4 无 G1 权限`);
   } catch (err) {
     step(`   ${OK()} 已拒绝：${err.message}`);
   }
   try {
-    const g = runtime.engine.signGate('G1', { actorId: 'ou_xxx3', note: '立项评审通过' });
+    const g = await runtime.signGate('G1', { actorId: 'ou_xxx3', note: '立项评审通过' });
     step(`   ${OK()} G1 已由 ${g.signed_by} 放行`);
   } catch (err) {
     step(`   ${C.yellow('⚠')} G1 未放行：${err.message}`);
@@ -470,7 +496,7 @@ async function cmdDemo(args) {
 async function cmdModel(args) {
   const dir = path.resolve(need(args, 'dir', 'model 需要 --dir'));
   const runtime = await Runtime.create({
-    dir, options: { source: 'local', policyFile: args.policy, modelFile: args.file },
+    dir, options: { source: 'local', policyFile: args.policy, modelFile: args.file, recover: false },
   });
   try {
     const info = runtime.status().model;
@@ -533,7 +559,8 @@ async function cmdHelp() {
   status    一次健康检查（--dir --json），退出码 0/1/2/3
   say       投递一条消息（--dir --as --chat --id --not-addressed "正文"）
   tickets   列出工单；--id 看单张全链路
-  gate      list | check <G> | sign <G> --as <open_id> | return <G> --as <open_id>
+  retry     重新派工（retry <ticket_id> --dir --as <open_id>）
+  gate      list | check <G> | sign/return/resubmit <G> --as <open_id>
   model     查看模型网关配置（--dir --file），--check 发一条最小请求自检
   verify    全量校验：配置、文档结构、资产落位、门禁（--mode strict|legacy|report|auto）
   classify  查看文件会落到哪个目录
@@ -563,7 +590,7 @@ async function cmdHelp() {
 
 const COMMANDS = {
   init: cmdInit, run: cmdRun, status: cmdStatus, say: cmdSay,
-  tickets: cmdTickets, gate: cmdGate, model: cmdModel, verify: cmdVerify,
+  tickets: cmdTickets, retry: cmdRetry, gate: cmdGate, model: cmdModel, verify: cmdVerify,
   classify: cmdClassify, demo: cmdDemo, help: cmdHelp,
 };
 

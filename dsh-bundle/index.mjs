@@ -1,34 +1,31 @@
-// electronics-superagent 的 DSH/Cordis 宿主插件。
-// 职责：在 DSH 会话内启动 superagent 引擎（飞书来源 + 面板），
-// 并把「固件代码修改」后端注入为 DSH 的 software-engineer preset——
-// 即真正改固件的是 DSH agent（在隔离的 preset 会话里），而不是自建模型网关。
-//
-// 生命周期全部交给 ctx.effect：DSH 卸载本插件时会逆序执行 disposer，
-// 关闭 HTTP server、停止引擎轮询、关闭 SQLite。
-
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { promises as fs, readFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { promises as fs } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-// 本 bundle 通过 junction 挂到 ~/.dsh/bundles，相对路径 '../mvp' 会解析到 junction
-// 的父目录而非源码目录，因此引擎依赖统一用源码绝对路径。
-const ENGINE_DIR = 'D:/yoxi/superagent/electronics-superagent/mvp/src';
+// DSH 可能保留 junction 路径，实际源码目录才有相邻的 mvp。
+const BUNDLE_DIR = path.dirname(await fs.realpath(fileURLToPath(import.meta.url)));
+const ENGINE_DIR = path.resolve(BUNDLE_DIR, '../mvp/src');
 const engineImport = (rel) => import(pathToFileURL(path.join(ENGINE_DIR, rel)).href);
+try { await fs.access(path.join(ENGINE_DIR, 'app/runtime.mjs')); }
+catch { throw new Error(`找不到 ${ENGINE_DIR} 中的引擎；请从完整 checkout 加载 dsh-bundle，或建立指向该目录的 junction`); }
 const { Runtime } = await engineImport('app/runtime.mjs');
 const { createPanelServer } = await engineImport('panel/server.mjs');
-const { ensureDir, exists, readFileSafe, sha256Text } = await engineImport('util/fsx.mjs');
-const { isAllowedCodePath } = await engineImport('executor/codegen.mjs');
 
 export const name = 'electronics-superagent';
-export const inject = ['agentPresets', 'agents', 'sessions'];
+export const inject = ['agentDefaultModel', 'agentPresets', 'agents', 'sessions', 'tools'];
 
 // 从 ~/.superagent/feishu.env 加载飞书凭据（格式：export KEY = value）。
 // 只在缺失时注入，不覆盖 DSH 进程已有的环境变量。
-function loadFeishuEnv() {
+async function loadFeishuEnv() {
   const file = path.join(os.homedir(), '.superagent', 'feishu.env');
-  if (!exists(file)) return;
-  const text = readFileSync(file, 'utf8');
+  let text;
+  try { text = await fs.readFile(file, 'utf8'); }
+  catch (err) {
+    if (err.code === 'ENOENT') return;
+    throw err;
+  }
   for (const line of text.split(/\r?\n/)) {
     const m = /^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
     if (!m) continue;
@@ -47,66 +44,35 @@ function log(ctx, msg) {
   catch { console.log(`[electronics-superagent] ${msg}`); }
 }
 
-// DSH agent 执行固件修改的提示词。
-function buildFirmwarePrompt({ relPath, requirement, notes }) {
+async function loadFirmwareSkill(config) {
+  const dir = config.skillsDir || process.env.SUPERAGENT_SKILLS_DIR || path.join(BUNDLE_DIR, 'skills');
+  const skillPath = path.resolve(dir, 'firmware-change/SKILL.md');
+  try { return await fs.readFile(skillPath, 'utf8'); }
+  catch (err) {
+    throw new Error(`无法读取固件技能 ${skillPath}（${err.code ?? err.message}）；请检查 skillsDir 或 SUPERAGENT_SKILLS_DIR`);
+  }
+}
+
+function buildFirmwarePrompt({ relPath, requirement, notes, original, skill }) {
   return [
-    '你是 T23 项目的软件工程师，请修改固件源码实现下述需求。',
+    '你是项目的软件工程师，请基于给定源码生成完整的候选文件。',
+    '',
+    skill,
     '',
     `目标文件（相对项目根）：${relPath}`,
     `需求：${requirement}`,
     notes ? `补充约束：${notes}` : '',
     '',
-    '严格要求：',
-    '1. 只允许修改上面指定的目标文件，不得改动 SDK/CMSIS/middleware/bootloader/构建产物。',
-    '2. 遵循现有代码风格，改动最小；未涉及的函数与注释原样保留。',
-    '3. 先读取原文件全文，再给出「完整修改后的文件内容」，不要只给片段或 diff。',
-    '4. 输出必须是可编译的 C 源码全文，从第一个字符到最后一个字符，不要包裹在解释性文字里。',
-    '5. 不要虚构不存在的函数或宏；无法安全实现时明确说明并保持文件不变。',
-  ].filter(Boolean).join('\n');
+    '=== 目标文件原文 ===',
+    original,
+  ].join('\n');
 }
 
-// 从 DSH agent 的 session 日志里抽取最后一条 assistant 文本。
-function lastAssistantText(session) {
-  try {
-    const events = session.events?.() ?? [];
-    let text = '';
-    for (const ev of events) {
-      if (ev.type === 'assistant/message' && Array.isArray(ev.data?.content)) {
-        for (const part of ev.data.content) {
-          if (part?.type === 'text' && typeof part.text === 'string') text = part.text;
-        }
-      }
-    }
-    return text;
-  } catch {
-    return '';
-  }
-}
-
-// 从模型输出里提取完整源码：优先 ```c ... ``` 代码块，否则整体作为源码。
-function extractSource(text) {
-  if (!text || typeof text !== 'string') return null;
-  const fence = /```(?:c|h|cpp)?\s*\n([\s\S]*?)\n```/i.exec(text);
-  let src = fence ? fence[1] : text.trim();
-  // 去掉模型常见的开场白（若首行不是预处理/注释/代码起始）
-  const lines = src.split('\n');
-  const firstCode = lines.findIndex((l) => /^\s*(#|\/\*|\/\/|[A-Za-z_])/.test(l));
-  if (firstCode > 0) src = lines.slice(firstCode).join('\n');
-  return src.trim().length ? src : null;
-}
-
-// 构造注入给 Runtime 的 codeModifier：在 DSH 会话内驱动 software-engineer preset。
-export function makeDshCodeModifier(ctx, config) {
+export function makeDshCodeModifier(ctx, config = {}, loadedSkill = null) {
   return async function dshCodeModifier({
-    projectRoot, relPath, requirement, notes = '', engine, ticketId = null,
+    relPath, original, requirement, notes = '', ticketId = null,
   }) {
-    const absPath = path.resolve(projectRoot, relPath);
-    // 硬校验：即便由 DSH agent 执行，也必须落在固件应用代码白名单内
-    if (!isAllowedCodePath(projectRoot, absPath)) {
-      throw new Error(`拒绝修改：${relPath} 不在固件应用代码白名单内（禁止 SDK/CMSIS/middleware/boot）`);
-    }
-    const original = await readFileSafe(absPath, null);
-    if (original == null) throw new Error(`目标文件不存在：${relPath}`);
+    const skill = loadedSkill ?? await loadFirmwareSkill(config);
 
     log(ctx, `code-change -> software-engineer preset: ${relPath}`);
 
@@ -117,69 +83,61 @@ export function makeDshCodeModifier(ctx, config) {
     }
 
     const presetId = config.codePresetId ?? 'software-engineer';
-    // 解析 preset，失败则报错而不是静默回退到网关（避免"以为在 DSH 改其实没改"）
+    if (presetId !== 'software-engineer') throw new Error('固件候选生成需要 bundle 自带的 software-engineer preset');
     const preset = await presets.resolve(presetId);
     if (!preset) throw new Error(`未找到 DSH preset：${presetId}`);
+    if (preset.broken) throw new Error(`DSH preset ${presetId} 未就绪：${preset.broken}`);
 
-    const sessionId = `esa-code-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const selection = ctx.agentDefaultModel?.currentSelection();
+    if (!selection?.provider || !selection?.model) throw new Error('请先配置 DSH profile 的默认模型');
+
     const setup = async (agentCtx) => {
       await presets.mount(agentCtx, preset.id);
+      // dsh-base 的全局工具也会被 Agent 继承，需为这次源码会话显式拦截。
+      agentCtx.tools.restrict({ allow: [] });
+      agentCtx.tools.guard(() => '固件候选会话只允许生成源码文本');
     };
-    const handle = await agents.create({
-      sessionId,
-      meta: { cwd: projectRoot, agentPreset: preset.id, ticketId, purpose: 'firmware-code-change' },
-      setup,
+    const { agent, dispose } = await agents.create({
+      sessionId: `esa-code-${randomUUID()}`,
+      meta: { cwd: BUNDLE_DIR, agentPreset: preset.id, ticketId, purpose: 'firmware-code-change' },
+      agentOptions: selection, setup,
     });
-    const agent = handle.agent;
-
-    // 投递任务并等待 agent 空闲（headless 内部同一套公开 API）。
-    // 直接构造 user message 结构，避免 bundle 跨 node_modules 裸包 import '@deepseek-ai/dsh-llm'。
-    agent.followup({
-      id: `msg-${Date.now()}`,
-      role: 'user',
-      content: [{ type: 'text', text: buildFirmwarePrompt({ relPath, requirement, notes }) }],
-      source: { kind: 'user' },
-    });
-
-    const subagents = ctx.subagents;
-    // 等待一轮完成：whenIdle + 子 agent 静默 + session 序列稳定
-    for (let i = 0; i < 3; i += 1) {
+    let text = '';
+    let reason = null;
+    let unwatch;
+    try {
       await agent.whenIdle();
-      const seq = agent.session.seq;
-      if (!subagents || !await subagents.waitForChildren(agent)) {
-        if (agent.status === 'idle' && agent.session.seq === seq) break;
+      unwatch = ctx.on('session/event', (session, event) => {
+        if (session !== agent.session) return;
+        if (event.type === 'turn/start') {
+          text = '';
+          reason = null;
+        } else if (event.type === 'assistant/message') {
+          const content = event.data.message.content.filter((block) => block.type === 'text').map((block) => block.text).join('');
+          if (content) text = content;
+        } else if (event.type === 'turn/end') {
+          reason = event.data.reason;
+        }
+      });
+      agent.followup({
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: buildFirmwarePrompt({ relPath, requirement, notes, original, skill }) }],
+        source: { kind: 'user' },
+      });
+      await agent.whenIdle();
+      if (ctx.sessions?.flush) await ctx.sessions.flush(agent.session);
+      if (reason?.kind !== 'completed') {
+        throw new Error(`DSH 源码生成未完成（${reason?.error?.code ?? reason?.kind ?? '缺少终止事件'}）`);
       }
+      if (!text.trim()) throw new Error('DSH software-engineer preset 未返回候选源码');
+      if (/^\s*BLOCKED:/i.test(text)) throw new Error(text.trim().slice(0, 300));
+      const fence = /^\s*```(?:c|h|cpp)?[^\S\r\n]*\r?\n([\s\S]*?\r?\n)```\s*$/i.exec(text);
+      return { text: fence?.[1] ?? text, model: selection.model, keyId: preset.id, tokens: 0 };
+    } finally {
+      unwatch?.();
+      await dispose();
     }
-    if (ctx.sessions?.flush) await ctx.sessions.flush(agent.session);
-
-    const text = lastAssistantText(agent.session);
-    const src = extractSource(text);
-    if (!src) {
-      throw new Error('DSH software-engineer preset 未返回可解析的源码；固件保持不变');
-    }
-    if (src === original || src.trim() === original.trim()) {
-      return { changed: false, sha256: sha256Text(original), model: preset.id, keyId: preset.id, tokens: 0 };
-    }
-    // 明显的破坏信号：大幅缩水或残留占位符
-    if (src.length < original.length * 0.6 || /<[^>]+>|TODO_FILL|\.\.\.\s*\/\/\s*省略/.test(src)) {
-      throw new Error('DSH 输出疑似截断或含占位符，拒绝写入；固件保持不变');
-    }
-
-    // 备份后写入（与内置 codegen 一致的约定）
-    const backupDir = path.join(projectRoot, '.state', 'codegen');
-    await ensureDir(backupDir);
-    const backupPath = path.join(backupDir, `${path.basename(relPath)}.${Date.now()}.bak`);
-    await fs.writeFile(backupPath, original, 'utf8');
-    await fs.writeFile(absPath, src, 'utf8');
-
-    return {
-      changed: true,
-      sha256: sha256Text(src),
-      backupPath,
-      model: preset.id,
-      keyId: preset.id,
-      tokens: 0,
-    };
   };
 }
 
@@ -187,16 +145,19 @@ export function apply(ctx, config = {}) {
   const state = { runtime: null, panel: null };
 
   ctx.effect(async () => {
-    const dir = config.projectDir;
-    // 飞书来源需要凭据；从 ~/.superagent/feishu.env 注入缺失的环境变量。
-    if ((config.source ?? 'local') === 'feishu') loadFeishuEnv();
-    if (!dir || !await exists(dir)) {
-      throw new Error(`electronics-superagent.projectDir 不存在：${dir}`);
+    const projectDir = config.projectDir || process.env.SUPERAGENT_PROJECT_DIR;
+    if (!projectDir || !(await fs.stat(projectDir).catch(() => null))?.isDirectory()) {
+      throw new Error(`请通过 electronics-superagent.projectDir 或 SUPERAGENT_PROJECT_DIR 指定有效的项目目录（当前：${projectDir ?? '未配置'}）`);
     }
+    const dir = await fs.realpath(projectDir);
+    const skill = await loadFirmwareSkill(config);
+    const source = config.source ?? process.env.SUPERAGENT_SOURCE ?? 'local';
+    if (source === 'feishu') await loadFeishuEnv();
 
     const options = {
-      source: config.source ?? 'local',
-      codeModifier: makeDshCodeModifier(ctx, config),
+      source,
+      codeModifier: makeDshCodeModifier(ctx, config, skill),
+      firmwareBuild: config.firmwareBuild,
     };
     if (config.modelFile) options.modelFile = config.modelFile;
     if (config.policyFile) options.policyFile = config.policyFile;
